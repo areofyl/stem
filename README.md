@@ -1,6 +1,6 @@
 I discovered stereo recently (in the last month) and it struck me as odd that all music files don't have stereo. I mean, once you hear it, there's no going back - it's just too good! 
 
-I wanted to figure out a way to make stereo better (so that it doesn't sound like sound jumping between ears), so I made a program (it was not simple, I will tell you that much!) which would rotate a sound around your head with stereo using [https://en.wikipedia.org/wiki/Head-related_transfer_function](HRTF), which worked *really* well.
+I wanted to figure out a way to make stereo better (so that it doesn't sound like sound jumping between ears), so I made a program (it was not simple, I will tell you that much!) which would rotate a sound around your head with stereo using [HRTF](https://en.wikipedia.org/wiki/Head-related_transfer_function), which worked *really* well.
 
 I finally felt like stereo could be heard with simple, lossy files which I downloaded with yt-dlp. I didn't need the fancy speakers and vinyls (which audiophiles swear by). I just need some opus files and some C :)
 
