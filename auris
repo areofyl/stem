@@ -1,0 +1,79 @@
+#!/bin/sh
+#
+# auris — separate a music file into stems, spatialize each around
+#         the listener, and mix back to binaural stereo.
+#
+# Usage: ./auris [-t seconds] [-q] input.mp3 [output.wav]
+#        ./auris song.flac                  # first 60s, fast model
+#        ./auris -t 0 song.flac             # full track
+#        ./auris -q song.flac               # quality mode (slower, cleaner)
+#
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SPATIALIZE="$SCRIPT_DIR/spatialize"
+
+# Default stem positions (azimuth:elevation in degrees)
+#   0 = front, 90 = right, -90 = left, 180 = behind
+POS_VOCALS="0:0"        # front center
+POS_DRUMS="160:15"      # behind, slightly right, slightly above
+POS_BASS="20:-5"        # front, slightly right
+POS_OTHER="-60:10"      # left, slightly above
+
+DURATION=60
+MODEL=htdemucs
+
+die() { printf "error: %s\n" "$1" >&2; exit 1; }
+
+command -v demucs >/dev/null 2>&1 || die "demucs not found (pip install demucs)"
+command -v ffmpeg >/dev/null 2>&1 || die "ffmpeg not found"
+[ -x "$SPATIALIZE" ] || die "spatialize not built — run: gcc -O2 -o spatialize spatialize.c -lsndfile -lm"
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+		-t) DURATION="$2"; shift 2 ;;
+		-q) MODEL=htdemucs_ft; shift ;;
+		-*) die "unknown flag: $1" ;;
+		*)  break ;;
+	esac
+done
+
+[ $# -lt 1 ] && die "usage: auris [-t seconds] [-q] input.mp3 [output.wav]"
+
+INPUT="$1"
+[ -f "$INPUT" ] || die "file not found: $INPUT"
+
+BASENAME="$(basename "$INPUT" | sed 's/\.[^.]*$//')"
+OUTPUT="${2:-${BASENAME}_3d.wav}"
+WORKDIR="/tmp/auris_$$"
+mkdir -p "$WORKDIR"
+
+cleanup() { rm -rf "$WORKDIR"; }
+trap cleanup EXIT
+
+# Trim input
+if [ "$DURATION" -gt 0 ] 2>/dev/null; then
+	echo "--- trimming to ${DURATION}s ---"
+	ffmpeg -y -i "$INPUT" -t "$DURATION" -ar 44100 "$WORKDIR/input.wav" 2>/dev/null
+	DEMUCS_INPUT="$WORKDIR/input.wav"
+else
+	DEMUCS_INPUT="$INPUT"
+fi
+
+echo "--- separating stems ($MODEL) ---"
+OMP_NUM_THREADS=8 demucs -n "$MODEL" "$DEMUCS_INPUT" -o "$WORKDIR/stems"
+
+DEMUCS_BASENAME="$(basename "$DEMUCS_INPUT" | sed 's/\.[^.]*$//')"
+STEMDIR="$WORKDIR/stems/$MODEL/$DEMUCS_BASENAME"
+
+[ -d "$STEMDIR" ] || die "demucs output not found at $STEMDIR"
+
+echo "--- spatializing ---"
+"$SPATIALIZE" -o "$OUTPUT" \
+    "$STEMDIR/vocals.wav:$POS_VOCALS" \
+    "$STEMDIR/drums.wav:$POS_DRUMS" \
+    "$STEMDIR/bass.wav:$POS_BASS" \
+    "$STEMDIR/other.wav:$POS_OTHER"
+
+echo "--- done: $OUTPUT ---"
