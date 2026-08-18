@@ -1,17 +1,22 @@
-training pipeline for stem custom separator
+This is for training your own stem separation model from scratch. The idea is you take a bunch of songs, run them through the best existing models to get stems, then train a smaller model on that output. It's basically distillation but you pre-compute everything so training is fast.
 
-1. upload your music to the cloud box
-2. run batch separation to create training data:
-   python3 batch_separate.py /path/to/music /path/to/stems
-3. train:
-   python3 train.py --data /path/to/stems --size small --epochs 200
-4. test it:
-   python3 inference.py checkpoints/best.pt song.wav output/
-5. download best.pt to your machine (~50MB)
+The model is a band-split transformer - it chops the spectrogram into frequency bands, runs a transformer on each one, then reconstructs the stems. Nothing fancy, just the parts that work.
 
-model sizes:
-  tiny   ~3M params   fastest, rougher quality
-  small  ~8M params   good balance
-  medium ~15M params  best quality, slower
+You'll want a cloud GPU for this (A100 on Lambda/RunPod, ~$1.50/hr). The whole thing takes maybe $10-15 and an afternoon.
 
-to use in stem, replace fast_separate.py with inference.py
+Steps:
+  1. Rent a GPU box, upload your music
+  2. python3 batch_separate.py /path/to/music /path/to/stems
+     (this runs htdemucs_6s on everything, takes 1-2hrs on GPU)
+  3. python3 train.py --data /path/to/stems --size small --epochs 200
+     (actual training, 4-8hrs)
+  4. python3 inference.py checkpoints/best.pt song.wav output/
+     (test it on something)
+  5. Download best.pt (~50MB), use it in stem
+
+Model sizes:
+  tiny   ~3M params   probably sounds rough but runs in <1s
+  small  ~8M params   good starting point
+  medium ~15M params  if small isn't cutting it
+
+The trained model runs on any machine - you train on a cloud A100 but inference works fine on CPU. The whole point is to get something small enough to run fast on ARM.
