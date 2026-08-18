@@ -205,7 +205,7 @@ typedef struct {
 	float         wet;
 } Reverb;
 
-static void reverb_init(Reverb *rv, double sr)
+static void reverb_init(Reverb *rv, double sr, float wet)
 {
 	/* Comb filter delays in ms, tuned for a medium room */
 	double comb_ms[NUM_COMBS] = { 29.7, 37.1, 41.1, 43.7 };
@@ -228,7 +228,7 @@ static void reverb_init(Reverb *rv, double sr)
 		allpass_init(&rv->allpass_r[i], len + stereo_offset / 2);
 	}
 
-	rv->wet = 0.12f;  /* subtle — just enough to fill the space */
+	rv->wet = wet;
 }
 
 static void reverb_process(Reverb *rv, float dry_l, float dry_r, float *out_l, float *out_r)
@@ -326,6 +326,7 @@ typedef struct {
 	char   *filename;
 	double azimuth;
 	double elevation;
+	float  stem_gain;   /* linear gain applied to this stem */
 
 	float  *samples_l;
 	float  *samples_r;
@@ -514,21 +515,51 @@ static void usage(const char *prog)
 		prog, prog);
 }
 
-static int parse_stem_arg(const char *arg, char **file, double *az, double *el)
+static int parse_stem_arg(const char *arg, char **file, double *az, double *el, double *gain_db)
 {
-	const char *p1 = strrchr(arg, ':');
-	if (!p1) return -1;
-	const char *p0 = p1 - 1;
-	while (p0 > arg && *p0 != ':') p0--;
-	if (*p0 != ':' || p0 == arg) return -1;
+	/* format: filename:azimuth:elevation[:gain_db] */
+	*gain_db = 0.0;
 
-	int flen = (int)(p0 - arg);
+	/* Count colons from the end to find fields */
+	const char *colons[4];
+	int ncolons = 0;
+	for (const char *p = arg + strlen(arg) - 1; p > arg && ncolons < 4; p--) {
+		if (*p == ':') colons[ncolons++] = p;
+	}
+
+	if (ncolons < 2) return -1;
+
+	const char *p_el, *p_az, *p_gain = NULL;
+
+	if (ncolons >= 3) {
+		/* Could be file:az:el:gain or file-with-colon:az:el */
+		/* Try 4-field parse: check if the 3rd-from-end colon gives valid numbers */
+		p_gain = colons[0];  /* last colon -> gain */
+		p_el   = colons[1];  /* second-to-last -> el */
+		p_az   = colons[2];  /* third-to-last -> az */
+
+		/* Validate: az and el fields should look like numbers */
+		char *end;
+		strtod(p_az + 1, &end);
+		if (end != p_el) {
+			/* 3-field: file-with-colon:az:el */
+			p_gain = NULL;
+			p_el = colons[0];
+			p_az = colons[1];
+		}
+	} else {
+		p_el = colons[0];
+		p_az = colons[1];
+	}
+
+	int flen = (int)(p_az - arg);
 	*file = malloc(flen + 1);
 	memcpy(*file, arg, flen);
 	(*file)[flen] = '\0';
 
-	*az = atof(p0 + 1) * M_PI / 180.0;
-	*el = atof(p1 + 1) * M_PI / 180.0;
+	*az = atof(p_az + 1) * M_PI / 180.0;
+	*el = atof(p_el + 1) * M_PI / 180.0;
+	if (p_gain) *gain_db = atof(p_gain + 1);
 	return 0;
 }
 
@@ -540,13 +571,16 @@ int main(int argc, char **argv)
 	}
 
 	const char *outfile = NULL;
+	float reverb_wet = 0.12f;
 	int stem_start = 1;
 
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
 			outfile = argv[++i];
 			stem_start = i + 1;
-			break;
+		} else if (strcmp(argv[i], "-r") == 0 && i + 1 < argc) {
+			reverb_wet = (float)atof(argv[++i]);
+			stem_start = i + 1;
 		}
 	}
 
@@ -564,18 +598,22 @@ int main(int argc, char **argv)
 	Stem *stems = calloc(nstem, sizeof(Stem));
 
 	for (int i = 0; i < nstem; i++) {
-		double az, el;
+		double az, el, gain_db;
 		char *file;
-		if (parse_stem_arg(argv[stem_start + i], &file, &az, &el) < 0) {
-			fprintf(stderr, "Bad stem arg: %s (expected file:az:el)\n",
+		if (parse_stem_arg(argv[stem_start + i], &file, &az, &el, &gain_db) < 0) {
+			fprintf(stderr, "Bad stem arg: %s (expected file:az:el[:gain_db])\n",
 			        argv[stem_start + i]);
 			return 1;
 		}
 		stems[i].filename  = file;
 		stems[i].azimuth   = az;
 		stems[i].elevation = el;
-		printf("  stem %d: %s at az=%.0f° el=%.0f°\n",
-		       i, file, az * 180.0 / M_PI, el * 180.0 / M_PI);
+		stems[i].stem_gain = (float)pow(10.0, gain_db / 20.0);
+		printf("  stem %d: %s at az=%.0f° el=%.0f°%s\n",
+		       i, file, az * 180.0 / M_PI, el * 180.0 / M_PI,
+		       gain_db != 0.0 ? "" : "");
+		if (gain_db != 0.0)
+			printf("           gain=%.1fdB\n", gain_db);
 	}
 
 	int max_frames = 0;
@@ -603,7 +641,7 @@ int main(int argc, char **argv)
 
 	/* Global late reverb */
 	Reverb reverb;
-	reverb_init(&reverb, (double)sample_rate);
+	reverb_init(&reverb, (double)sample_rate, reverb_wet);
 
 	float *out = calloc(max_frames * 2, sizeof(float));
 	if (!out) { fprintf(stderr, "alloc failed\n"); return 1; }
@@ -613,8 +651,8 @@ int main(int argc, char **argv)
 		Stem *s = &stems[i];
 
 		for (int n = 0; n < max_frames; n++) {
-			float sig_l = (n < s->num_frames) ? s->samples_l[n] : 0.0f;
-			float sig_r = (n < s->num_frames) ? s->samples_r[n] : 0.0f;
+			float sig_l = (n < s->num_frames) ? s->samples_l[n] * s->stem_gain : 0.0f;
+			float sig_r = (n < s->num_frames) ? s->samples_r[n] * s->stem_gain : 0.0f;
 
 			/* Direct sound through binaural paths */
 			float out_l = 0.0f, out_r = 0.0f;

@@ -1,0 +1,131 @@
+#!/bin/sh
+# stem - split a song into stems and spatialize them into binaural 3d
+#
+# ./stem song.mp3                        60s, fast
+# ./stem -q song.mp3                     60s, full quality (4x slower)
+# ./stem -t 0 song.mp3                   full track
+# ./stem --theater song.mp3              6-stem theater layout
+# ./stem --glue 50 song.mp3              blend 50% original mix in
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SPATIALIZE="$SCRIPT_DIR/spatialize"
+FAST_SEP="$SCRIPT_DIR/fast_separate.py"
+
+DURATION=60
+MODEL=htdemucs_ft
+PRESET=default
+QUALITY=fast
+GLUE=0
+
+die() { printf "error: %s\n" "$1" >&2; exit 1; }
+
+command -v ffmpeg >/dev/null 2>&1 || die "ffmpeg not found"
+[ -x "$SPATIALIZE" ] || die "spatialize not built — gcc -O2 -o spatialize spatialize.c -lsndfile -lm"
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+		-t) DURATION="$2"; shift 2 ;;
+		-q) QUALITY=quality; shift ;;
+		--theater) PRESET=theater; shift ;;
+		--glue) GLUE="$2"; shift 2 ;;
+		-*) die "unknown flag: $1" ;;
+		*)  break ;;
+	esac
+done
+
+[ $# -lt 1 ] && die "usage: stem [-t sec] [-q] [--theater] [--glue N] input [output.wav]"
+
+INPUT="$1"
+[ -f "$INPUT" ] || die "file not found: $INPUT"
+
+BASENAME="$(basename "$INPUT" | sed 's/\.[^.]*$//')"
+OUTPUT="${2:-${BASENAME}_3d.wav}"
+WORKDIR="/tmp/stem_$$"
+mkdir -p "$WORKDIR"
+
+cleanup() { rm -rf "$WORKDIR"; }
+trap cleanup EXIT
+
+STEMDIR="$WORKDIR/stems"
+
+# theater needs 6-stem model
+[ "$PRESET" = "theater" ] && MODEL=htdemucs_6s
+
+# show what we're doing
+DUR_STR="full track"
+[ "$DURATION" -gt 0 ] 2>/dev/null && DUR_STR="${DURATION}s"
+GLUE_STR="off"
+[ "$GLUE" -gt 0 ] 2>/dev/null && GLUE_STR="${GLUE}%"
+if [ "$QUALITY" = "fast" ]; then
+	QUANT_STR="float32 (1 of 4 models)"
+else
+	QUANT_STR="float32 (full bag, 4 models)"
+fi
+echo "   duration: $DUR_STR"
+echo "   model: $MODEL"
+echo "   quantization: $QUANT_STR"
+echo "   preset: $PRESET"
+echo "   glue: $GLUE_STR"
+echo ""
+
+# convert to wav, trim if needed
+if [ "$DURATION" -gt 0 ] 2>/dev/null; then
+	ffmpeg -y -i "$INPUT" -t "$DURATION" -ar 44100 "$WORKDIR/input.wav" 2>/dev/null
+else
+	ffmpeg -y -i "$INPUT" -ar 44100 "$WORKDIR/input.wav" 2>/dev/null
+fi
+DEMUCS_INPUT="$WORKDIR/input.wav"
+
+echo " separating stems"
+
+if [ "$QUALITY" = "quality" ]; then
+	command -v demucs >/dev/null 2>&1 || die "demucs not found"
+	OMP_NUM_THREADS=8 demucs -n "$MODEL" "$DEMUCS_INPUT" -o "$WORKDIR/demucs_out"
+	DEMUCS_BASENAME="$(basename "$DEMUCS_INPUT" | sed 's/\.[^.]*$//')"
+	STEMDIR="$WORKDIR/demucs_out/$MODEL/$DEMUCS_BASENAME"
+else
+	OMP_NUM_THREADS=8 AURIS_MODEL="$MODEL" python3 "$FAST_SEP" "$DEMUCS_INPUT" "$STEMDIR"
+fi
+
+[ -d "$STEMDIR" ] || die "stems not found at $STEMDIR"
+
+# keep a copy of the stems
+SAVE_STEMS="stemmed-$BASENAME"
+mkdir -p "$SAVE_STEMS"
+cp "$STEMDIR"/*.wav "$SAVE_STEMS/"
+echo " stems saved to $SAVE_STEMS/"
+
+# glue: mix original back in at center to mask artifacts
+GLUE_ARG=""
+if [ "$GLUE" -gt 0 ] 2>/dev/null; then
+	GLUE_DB=$(python3 -c "import math; print(f'{20*math.log10($GLUE/100):.1f}')")
+	GLUE_ARG="$DEMUCS_INPUT:0:0:$GLUE_DB"
+fi
+
+echo " spatializing"
+
+# +2.3dB on stems to match original loudness
+if [ "$PRESET" = "theater" ]; then
+	"$SPATIALIZE" -o "$OUTPUT" -r 0.22 \
+	    "$STEMDIR/vocals.wav:0:5:2.3" \
+	    "$STEMDIR/drums.wav:170:20:2.3" \
+	    "$STEMDIR/guitar.wav:75:0:2.3" \
+	    "$STEMDIR/piano.wav:-75:0:2.3" \
+	    "$STEMDIR/other.wav:50:10:2.3" \
+	    "$STEMDIR/bass.wav:0:-10:-6" \
+	    "$STEMDIR/bass.wav:90:0:-9" \
+	    "$STEMDIR/bass.wav:180:0:-9" \
+	    "$STEMDIR/bass.wav:-90:0:-9" \
+	    ${GLUE_ARG:+"$GLUE_ARG"}
+else
+	"$SPATIALIZE" -o "$OUTPUT" -r 0.12 \
+	    "$STEMDIR/vocals.wav:0:0:2.3" \
+	    "$STEMDIR/drums.wav:160:15:2.3" \
+	    "$STEMDIR/bass.wav:20:-5:2.3" \
+	    "$STEMDIR/other.wav:-60:10:2.3" \
+	    ${GLUE_ARG:+"$GLUE_ARG"}
+fi
+
+echo " done: $OUTPUT"

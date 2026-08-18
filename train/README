@@ -1,0 +1,17 @@
+training pipeline for stem custom separator
+
+1. upload your music to the cloud box
+2. run batch separation to create training data:
+   python3 batch_separate.py /path/to/music /path/to/stems
+3. train:
+   python3 train.py --data /path/to/stems --size small --epochs 200
+4. test it:
+   python3 inference.py checkpoints/best.pt song.wav output/
+5. download best.pt to your machine (~50MB)
+
+model sizes:
+  tiny   ~3M params   fastest, rougher quality
+  small  ~8M params   good balance
+  medium ~15M params  best quality, slower
+
+to use in stem, replace fast_separate.py with inference.py
