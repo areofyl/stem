@@ -281,7 +281,7 @@ static double calc_itd(double az)
 	if (a <= M_PI / 2.0)
 		itd = (HEAD_RADIUS / SPEED_SOUND) * (a + sin(a));
 	else
-		itd = (HEAD_RADIUS / SPEED_SOUND) * (M_PI / 2.0 + 1.0);
+		itd = (HEAD_RADIUS / SPEED_SOUND) * (M_PI - a + sin(a));
 	return (az >= 0.0) ? itd : -itd;
 }
 
