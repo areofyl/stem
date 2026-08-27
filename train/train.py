@@ -126,11 +126,19 @@ def train(args):
 
     os.makedirs(args.output, exist_ok=True)
 
-    print(f'  epochs: {start_epoch} -> {args.epochs}')
-    print(f'  batch size: {args.batch_size}')
-    print(f'  workers: {n_workers}')
-    print(f'  chunks: {args.chunk_length}s')
+    total_batches = len(train_loader)
+    print(f'epochs: {start_epoch} -> {args.epochs}')
+    print(f'batch size: {args.batch_size}, {total_batches} batches/epoch')
+    print(f'workers: {n_workers}, chunks: {args.chunk_length}s')
     print()
+
+    config = {
+        'size': args.size,
+        'source_names': SOURCES,
+        'sample_rate': 44100,
+        'n_fft': 2048,
+        'hop_length': 512,
+    }
 
     for epoch in range(start_epoch, args.epochs):
         model.train()
@@ -138,7 +146,7 @@ def train(args):
         n_batches = 0
         t0 = time.time()
 
-        for mix, stems in train_loader:
+        for batch_i, (mix, stems) in enumerate(train_loader):
             mix, stems = mix.to(device), stems.to(device)
 
             with torch.autocast(device_type=device, dtype=torch.bfloat16, enabled=use_amp):
@@ -156,22 +164,17 @@ def train(args):
             epoch_loss += loss.item()
             n_batches += 1
 
+            # live progress within epoch
+            avg = epoch_loss / n_batches
+            lr = optimizer.param_groups[0]['lr']
+            print(f'\r  epoch {epoch+1}/{args.epochs}  batch {batch_i+1}/{total_batches}  loss: {avg:.4f}  lr: {lr:.6f}', end='', flush=True)
+
         train_loss = epoch_loss / n_batches
         val_loss = validate(model, val_loader, device)
         elapsed = time.time() - t0
-        lr = optimizer.param_groups[0]['lr']
 
-        print(f'  epoch {epoch+1:3d}/{args.epochs}  '
-              f'train: {train_loss:.4f}  val: {val_loss:.4f}  '
-              f'lr: {lr:.6f}  time: {elapsed:.0f}s')
-
-        config = {
-            'size': args.size,
-            'source_names': SOURCES,
-            'sample_rate': 44100,
-            'n_fft': 2048,
-            'hop_length': 512,
-        }
+        # overwrite the batch progress line with final epoch summary
+        print(f'\r  epoch {epoch+1}/{args.epochs}  train: {train_loss:.4f}  val: {val_loss:.4f}  lr: {lr:.6f}  {elapsed:.0f}s')
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -179,7 +182,7 @@ def train(args):
                 'epoch': epoch, 'model_state': model.state_dict(),
                 'loss': val_loss, 'config': config,
             }, os.path.join(args.output, 'best.pt'))
-            print(f'    new best val loss: {best_val_loss:.4f}')
+            print(f'    ^ new best')
 
         torch.save({
             'epoch': epoch, 'model_state': model.state_dict(),
@@ -194,8 +197,8 @@ def train(args):
                 'loss': val_loss, 'config': config,
             }, os.path.join(args.output, f'checkpoint_{epoch+1}.pt'))
 
-    print(f'\ndone. best val loss: {best_val_loss:.4f}')
-    print(f'model: {args.output}/best.pt')
+    print(f'\ndone, best val loss: {best_val_loss:.4f}')
+    print(f'model saved to {args.output}/best.pt')
 
 
 if __name__ == '__main__':

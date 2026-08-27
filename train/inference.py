@@ -2,7 +2,7 @@
 # run the trained stem model on a song
 # usage: python3 inference.py best.pt input.wav output_dir
 
-import sys, os
+import sys, os, time
 import torch
 import soundfile as sf
 from model import make_model
@@ -17,7 +17,6 @@ def main():
     output_dir = sys.argv[3]
     os.makedirs(output_dir, exist_ok=True)
 
-    # load checkpoint
     checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
     config = checkpoint['config']
 
@@ -25,23 +24,24 @@ def main():
     model.load_state_dict(checkpoint['model_state'])
     model.eval()
 
-    # load audio
     audio, sr = sf.read(input_path, dtype='float32', always_2d=True)
-    audio = torch.from_numpy(audio.T)  # (channels, samples)
+    audio = torch.from_numpy(audio.T)
     if audio.shape[0] == 1:
         audio = audio.repeat(2, 1)
 
-    # separate
-    print('  separating...')
-    sources = model.separate(audio)
+    duration = audio.shape[1] / config['sample_rate']
+    print(f'separating {duration:.1f}s of audio...')
 
-    # save
+    t0 = time.time()
+    sources = model.separate(audio)
+    elapsed = time.time() - t0
+
+    print(f'done in {elapsed:.1f}s ({duration/elapsed:.1f}x realtime)')
+
     for i, name in enumerate(config['source_names']):
         out_path = os.path.join(output_dir, f'{name}.wav')
         sf.write(out_path, sources[i].numpy().T, config['sample_rate'])
         print(f'  saved {name}')
-
-    print(f'  done: {len(config["source_names"])} stems')
 
 if __name__ == '__main__':
     main()
