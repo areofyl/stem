@@ -21,13 +21,24 @@ def main():
     config = checkpoint['config']
 
     model = make_model(config['size'])
-    model.load_state_dict(checkpoint['model_state'])
+
+    # torch.compile prefixes keys with _orig_mod., strip it for loading
+    state = checkpoint['model_state']
+    state = {k.removeprefix('_orig_mod.'): v for k, v in state.items()}
+    model.load_state_dict(state)
     model.eval()
 
-    audio, sr = sf.read(input_path, dtype='float32', always_2d=True)
+    # convert to 44100Hz wav first if needed
+    import subprocess, tempfile
+    tmp_wav = os.path.join(tempfile.gettempdir(), 'stem_inference_input.wav')
+    subprocess.run([
+        'ffmpeg', '-y', '-i', input_path,
+        '-ar', str(config['sample_rate']), '-ac', '2', tmp_wav
+    ], capture_output=True)
+
+    audio, sr = sf.read(tmp_wav, dtype='float32', always_2d=True)
+    os.remove(tmp_wav)
     audio = torch.from_numpy(audio.T)
-    if audio.shape[0] == 1:
-        audio = audio.repeat(2, 1)
 
     duration = audio.shape[1] / config['sample_rate']
     print(f'separating {duration:.1f}s of audio...')
