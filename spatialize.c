@@ -2,11 +2,12 @@
  * spatialize.c — Place WAV stems at 3D positions around the listener
  *                with early reflections and late reverb for immersion.
  *
- * Compile:  gcc -O2 -o spatialize spatialize.c -lsndfile -lm
+ * Compile:  gcc -O3 -march=native -ffast-math -o spatialize spatialize.c -lsndfile -lm -lpthread
  * Usage:    ./spatialize -o out.wav vocals.wav:0:0 drums.wav:160:15 bass.wav:20:-5 other.wav:-60:5
  */
 
 #include <math.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,9 +17,11 @@
 #define SPEED_SOUND  343.0
 
 /* ---- Biquad filter ---- */
+/* coefficients computed as double for precision, then stored as float for speed.
+   state is float since we're processing float audio. */
 typedef struct {
-	double b0, b1, b2, a1, a2;
-	double x1, x2, y1, y2;
+	float b0, b1, b2, a1, a2;
+	float x1, x2, y1, y2;
 } Biquad;
 
 static void biquad_set_depth(Biquad *bq, double freq, double q, double depth, double sr)
@@ -32,12 +35,12 @@ static void biquad_set_depth(Biquad *bq, double freq, double q, double depth, do
 	double na1 = nb1;
 	double na2 = (1.0 - alpha) / a0;
 	double ab0 = na2, ab1 = na1, ab2 = 1.0;
-	bq->b0 = ab0 + depth * (nb0 - ab0);
-	bq->b1 = ab1 + depth * (nb1 - ab1);
-	bq->b2 = ab2 + depth * (nb2 - ab2);
-	bq->a1 = na1;
-	bq->a2 = na2;
-	bq->x1 = bq->x2 = bq->y1 = bq->y2 = 0.0;
+	bq->b0 = (float)(ab0 + depth * (nb0 - ab0));
+	bq->b1 = (float)(ab1 + depth * (nb1 - ab1));
+	bq->b2 = (float)(ab2 + depth * (nb2 - ab2));
+	bq->a1 = (float)na1;
+	bq->a2 = (float)na2;
+	bq->x1 = bq->x2 = bq->y1 = bq->y2 = 0.0f;
 }
 
 static void biquad_hishelf(Biquad *bq, double freq, double gain_db, double sr)
@@ -48,12 +51,12 @@ static void biquad_hishelf(Biquad *bq, double freq, double gain_db, double sr)
 	double alpha = sin(w0) / 2.0 * sqrt((A + 1.0/A) * (1.0/S - 1.0) + 2.0);
 	double cosw  = cos(w0);
 	double a0 = (A+1) - (A-1)*cosw + 2*sqrt(A)*alpha;
-	bq->b0 = (A*((A+1) + (A-1)*cosw + 2*sqrt(A)*alpha)) / a0;
-	bq->b1 = (-2*A*((A-1) + (A+1)*cosw))                / a0;
-	bq->b2 = (A*((A+1) + (A-1)*cosw - 2*sqrt(A)*alpha)) / a0;
-	bq->a1 = (2*((A-1) - (A+1)*cosw))                   / a0;
-	bq->a2 = ((A+1) - (A-1)*cosw - 2*sqrt(A)*alpha)     / a0;
-	bq->x1 = bq->x2 = bq->y1 = bq->y2 = 0.0;
+	bq->b0 = (float)((A*((A+1) + (A-1)*cosw + 2*sqrt(A)*alpha)) / a0);
+	bq->b1 = (float)((-2*A*((A-1) + (A+1)*cosw))                / a0);
+	bq->b2 = (float)((A*((A+1) + (A-1)*cosw - 2*sqrt(A)*alpha)) / a0);
+	bq->a1 = (float)((2*((A-1) - (A+1)*cosw))                   / a0);
+	bq->a2 = (float)(((A+1) - (A-1)*cosw - 2*sqrt(A)*alpha)     / a0);
+	bq->x1 = bq->x2 = bq->y1 = bq->y2 = 0.0f;
 }
 
 static void biquad_lowpass(Biquad *bq, double freq, double q, double sr)
@@ -61,21 +64,21 @@ static void biquad_lowpass(Biquad *bq, double freq, double q, double sr)
 	double w0 = 2.0 * M_PI * freq / sr;
 	double alpha = sin(w0) / (2.0 * q);
 	double a0 = 1.0 + alpha;
-	bq->b0 = ((1.0 - cos(w0)) / 2.0) / a0;
-	bq->b1 = (1.0 - cos(w0)) / a0;
+	bq->b0 = (float)(((1.0 - cos(w0)) / 2.0) / a0);
+	bq->b1 = (float)((1.0 - cos(w0)) / a0);
 	bq->b2 = bq->b0;
-	bq->a1 = (-2.0 * cos(w0)) / a0;
-	bq->a2 = (1.0 - alpha) / a0;
-	bq->x1 = bq->x2 = bq->y1 = bq->y2 = 0.0;
+	bq->a1 = (float)((-2.0 * cos(w0)) / a0);
+	bq->a2 = (float)((1.0 - alpha) / a0);
+	bq->x1 = bq->x2 = bq->y1 = bq->y2 = 0.0f;
 }
 
-static float biquad_tick(Biquad *bq, float x)
+static inline __attribute__((always_inline)) float biquad_tick(Biquad *bq, float x)
 {
-	double y = bq->b0 * x + bq->b1 * bq->x1 + bq->b2 * bq->x2
-	         - bq->a1 * bq->y1 - bq->a2 * bq->y2;
+	float y = bq->b0 * x + bq->b1 * bq->x1 + bq->b2 * bq->x2
+	        - bq->a1 * bq->y1 - bq->a2 * bq->y2;
 	bq->x2 = bq->x1; bq->x1 = x;
 	bq->y2 = bq->y1; bq->y1 = y;
-	return (float)y;
+	return y;
 }
 
 /* ---- Fractional delay line for ITD ---- */
@@ -139,114 +142,94 @@ static float ringbuf_tap(RingBuf *r, int delay)
 	return r->buf[(r->pos - delay) & RBUF_MASK];
 }
 
-/* ---- Schroeder reverb ---- */
-#define NUM_COMBS    4
-#define NUM_ALLPASS  2
+/* ---- FDN reverb (feedback delay network) ---- */
+/* 8 delay lines mixed through a Hadamard matrix.
+   way more diffuse and natural than Schroeder parallel combs. */
+
+#define FDN_N 8
 
 typedef struct {
 	float *buf;
 	int    len;
 	int    pos;
-	float  feedback;
-	float  damp;
-	float  damp_z;
-} CombFilter;
-
-static void comb_init(CombFilter *c, int len, float feedback, float damp)
-{
-	c->buf = calloc(len, sizeof(float));
-	c->len = len;
-	c->pos = 0;
-	c->feedback = feedback;
-	c->damp = damp;
-	c->damp_z = 0.0f;
-}
-
-static float comb_tick(CombFilter *c, float x)
-{
-	float out = c->buf[c->pos];
-	c->damp_z = out * (1.0f - c->damp) + c->damp_z * c->damp;
-	c->buf[c->pos] = x + c->damp_z * c->feedback;
-	c->pos = (c->pos + 1) % c->len;
-	return out;
-}
-
-static void comb_free(CombFilter *c) { free(c->buf); }
+} FDNDelay;
 
 typedef struct {
-	float *buf;
-	int    len;
-	int    pos;
-} AllpassFilter;
-
-static void allpass_init(AllpassFilter *a, int len)
-{
-	a->buf = calloc(len, sizeof(float));
-	a->len = len;
-	a->pos = 0;
-}
-
-static float allpass_tick(AllpassFilter *a, float x)
-{
-	float delayed = a->buf[a->pos];
-	float out = delayed - x;
-	a->buf[a->pos] = x + delayed * 0.5f;
-	a->pos = (a->pos + 1) % a->len;
-	return out;
-}
-
-static void allpass_free(AllpassFilter *a) { free(a->buf); }
-
-typedef struct {
-	CombFilter    combs_l[NUM_COMBS];
-	CombFilter    combs_r[NUM_COMBS];
-	AllpassFilter allpass_l[NUM_ALLPASS];
-	AllpassFilter allpass_r[NUM_ALLPASS];
-	float         wet;
+	FDNDelay delays[FDN_N];
+	float    feedback;
+	float    damp[FDN_N];     /* per-line damping state */
+	float    damp_coeff;      /* how much HF to absorb */
+	float    gains_l[FDN_N];  /* how much each line contributes to L */
+	float    gains_r[FDN_N];  /* same for R */
+	float    wet;
 } Reverb;
 
 static void reverb_init(Reverb *rv, double sr, float wet)
 {
-	/* Comb filter delays in ms, tuned for a medium room */
-	double comb_ms[NUM_COMBS] = { 29.7, 37.1, 41.1, 43.7 };
-	/* Stereo offset: slightly different lengths for L vs R */
-	int stereo_offset = (int)(0.5 * sr / 1000.0); /* 0.5ms */
+	/* prime-ish delay lengths in ms for maximum density.
+	   no two lines share common factors = less metallic ringing */
+	double delay_ms[FDN_N] = { 19.3, 23.7, 29.1, 31.7, 37.3, 41.1, 43.9, 47.3 };
 
-	float feedback = 0.84f;  /* RT60 ~ 0.8s */
-	float damp = 0.3f;       /* high freq absorption */
-
-	for (int i = 0; i < NUM_COMBS; i++) {
-		int len = (int)(comb_ms[i] * sr / 1000.0);
-		comb_init(&rv->combs_l[i], len, feedback, damp);
-		comb_init(&rv->combs_r[i], len + stereo_offset, feedback, damp);
-	}
-
-	double ap_ms[NUM_ALLPASS] = { 5.0, 1.7 };
-	for (int i = 0; i < NUM_ALLPASS; i++) {
-		int len = (int)(ap_ms[i] * sr / 1000.0);
-		allpass_init(&rv->allpass_l[i], len);
-		allpass_init(&rv->allpass_r[i], len + stereo_offset / 2);
-	}
-
+	rv->feedback = 0.82f;
+	rv->damp_coeff = 0.35f;
 	rv->wet = wet;
+
+	for (int i = 0; i < FDN_N; i++) {
+		int len = (int)(delay_ms[i] * sr / 1000.0);
+		rv->delays[i].buf = calloc(len, sizeof(float));
+		rv->delays[i].len = len;
+		rv->delays[i].pos = 0;
+		rv->damp[i] = 0.0f;
+
+		/* stereo: alternate lines lean L or R with slight offset */
+		float pan = (i % 2 == 0) ? 0.6f : 0.4f;
+		/* add some variation so it's not just hard L/R */
+		pan += (i / 2) * 0.05f - 0.075f;
+		rv->gains_l[i] = 1.0f - pan;
+		rv->gains_r[i] = pan;
+	}
 }
 
 static void reverb_process(Reverb *rv, float dry_l, float dry_r, float *out_l, float *out_r)
 {
-	float mono = (dry_l + dry_r) * 0.5f;
+	float input = (dry_l + dry_r) * 0.5f;
 
+	/* read from all delay lines */
+	float taps[FDN_N];
+	for (int i = 0; i < FDN_N; i++)
+		taps[i] = rv->delays[i].buf[rv->delays[i].pos];
+
+	/* Hadamard-like mixing: each output is a weighted sum of all taps.
+	   using a simple orthogonal pattern: +/- pairs that preserve energy */
+	float mixed[FDN_N];
+	float scale = 1.0f / 2.828f;  /* 1/sqrt(8) to preserve energy */
+	for (int i = 0; i < FDN_N; i++) {
+		mixed[i] = 0.0f;
+		for (int j = 0; j < FDN_N; j++) {
+			/* Hadamard sign pattern: positive if popcount(i&j) is even */
+			int bits = i & j;
+			int parity = 0;
+			while (bits) { parity ^= 1; bits &= bits - 1; }
+			mixed[i] += parity ? -taps[j] : taps[j];
+		}
+		mixed[i] *= scale;
+	}
+
+	/* write back into delay lines with feedback, damping, and input */
 	float wet_l = 0.0f, wet_r = 0.0f;
-	for (int i = 0; i < NUM_COMBS; i++) {
-		wet_l += comb_tick(&rv->combs_l[i], mono);
-		wet_r += comb_tick(&rv->combs_r[i], mono);
-	}
-	wet_l /= NUM_COMBS;
-	wet_r /= NUM_COMBS;
+	for (int i = 0; i < FDN_N; i++) {
+		/* one-pole lowpass damping (walls absorb high frequencies) */
+		float fb = mixed[i] * rv->feedback;
+		rv->damp[i] = fb * (1.0f - rv->damp_coeff) + rv->damp[i] * rv->damp_coeff;
 
-	for (int i = 0; i < NUM_ALLPASS; i++) {
-		wet_l = allpass_tick(&rv->allpass_l[i], wet_l);
-		wet_r = allpass_tick(&rv->allpass_r[i], wet_r);
+		rv->delays[i].buf[rv->delays[i].pos] = rv->damp[i] + input * 0.15f;
+		rv->delays[i].pos = (rv->delays[i].pos + 1) % rv->delays[i].len;
+
+		wet_l += taps[i] * rv->gains_l[i];
+		wet_r += taps[i] * rv->gains_r[i];
 	}
+	wet_l /= FDN_N;
+	wet_r /= FDN_N;
 
 	*out_l = dry_l + wet_l * rv->wet;
 	*out_r = dry_r + wet_r * rv->wet;
@@ -254,14 +237,8 @@ static void reverb_process(Reverb *rv, float dry_l, float dry_r, float *out_l, f
 
 static void reverb_free(Reverb *rv)
 {
-	for (int i = 0; i < NUM_COMBS; i++) {
-		comb_free(&rv->combs_l[i]);
-		comb_free(&rv->combs_r[i]);
-	}
-	for (int i = 0; i < NUM_ALLPASS; i++) {
-		allpass_free(&rv->allpass_l[i]);
-		allpass_free(&rv->allpass_r[i]);
-	}
+	for (int i = 0; i < FDN_N; i++)
+		free(rv->delays[i].buf);
 }
 
 /* ---- Binaural model ---- */
@@ -476,7 +453,7 @@ static void init_stem_binaurals(Stem *s, double sr)
 	}
 }
 
-static void process_binaural(BinauralState *b, float sig, float *out_l, float *out_r)
+static inline __attribute__((always_inline)) void process_binaural(BinauralState *b, float sig, float *out_l, float *out_r)
 {
 	delay_write(&b->dl_left, sig);
 	delay_write(&b->dl_right, sig);
@@ -500,6 +477,49 @@ static void process_binaural(BinauralState *b, float sig, float *out_l, float *o
 
 	*out_l = L;
 	*out_r = R;
+}
+
+/* thread job for parallel stem processing */
+typedef struct {
+	Stem  *stem;
+	float *buf;
+	int    max_frames;
+} StemJob;
+
+static void *stem_worker(void *arg)
+{
+	StemJob *j = (StemJob *)arg;
+	Stem *s = j->stem;
+	float *buf = j->buf;
+	int frames = j->max_frames;
+
+	for (int n = 0; n < frames; n++) {
+		float sig_l = (n < s->num_frames) ? s->samples_l[n] * s->stem_gain : 0.0f;
+		float sig_r = (n < s->num_frames) ? s->samples_r[n] * s->stem_gain : 0.0f;
+
+		float L, R;
+		float mix_l = 0.0f, mix_r = 0.0f;
+
+		process_binaural(&s->bin[0], sig_l, &L, &R);
+		mix_l += L; mix_r += R;
+		process_binaural(&s->bin[1], sig_r, &L, &R);
+		mix_l += L; mix_r += R;
+
+		float mono = (sig_l + sig_r) * 0.5f;
+		ringbuf_write(&s->ref_delay, mono);
+
+		for (int r = 0; r < NUM_REFLECTIONS; r++) {
+			Reflection *ref = &s->refs[r];
+			float delayed = ringbuf_tap(&s->ref_delay, ref->delay_samples);
+			float filtered = biquad_tick(&ref->wall_lpf, delayed) * ref->gain;
+			process_binaural(&ref->bin, filtered, &L, &R);
+			mix_l += L; mix_r += R;
+		}
+
+		buf[n * 2 + 0] = mix_l;
+		buf[n * 2 + 1] = mix_r;
+	}
+	return NULL;
 }
 
 static void usage(const char *prog)
@@ -646,59 +666,46 @@ int main(int argc, char **argv)
 	float *out = calloc(max_frames * 2, sizeof(float));
 	if (!out) { fprintf(stderr, "alloc failed\n"); return 1; }
 
-	/* Process all stems */
+	/* per-stem thread data */
+	StemJob *jobs = calloc(nstem, sizeof(StemJob));
 	for (int i = 0; i < nstem; i++) {
-		Stem *s = &stems[i];
-
-		for (int n = 0; n < max_frames; n++) {
-			float sig_l = (n < s->num_frames) ? s->samples_l[n] * s->stem_gain : 0.0f;
-			float sig_r = (n < s->num_frames) ? s->samples_r[n] * s->stem_gain : 0.0f;
-
-			/* Direct sound through binaural paths */
-			float out_l = 0.0f, out_r = 0.0f;
-			float sigs[2] = { sig_l, sig_r };
-
-			for (int ch = 0; ch < 2; ch++) {
-				float L, R;
-				process_binaural(&s->bin[ch], sigs[ch], &L, &R);
-				out_l += L;
-				out_r += R;
-			}
-
-			/* Early reflections (mono sum into shared delay line) */
-			float mono = (sig_l + sig_r) * 0.5f;
-			ringbuf_write(&s->ref_delay, mono);
-
-			for (int r = 0; r < NUM_REFLECTIONS; r++) {
-				Reflection *ref = &s->refs[r];
-				float delayed = ringbuf_tap(&s->ref_delay, ref->delay_samples);
-				float filtered = biquad_tick(&ref->wall_lpf, delayed) * ref->gain;
-
-				float rl, rr;
-				process_binaural(&ref->bin, filtered, &rl, &rr);
-				out_l += rl;
-				out_r += rr;
-			}
-
-			out[n * 2 + 0] += out_l;
-			out[n * 2 + 1] += out_r;
-		}
+		jobs[i].stem = &stems[i];
+		jobs[i].buf = calloc(max_frames * 2, sizeof(float));
+		jobs[i].max_frames = max_frames;
 	}
 
-	/* Apply global late reverb */
-	for (int n = 0; n < max_frames; n++) {
-		float rl, rr;
-		reverb_process(&reverb, out[n * 2], out[n * 2 + 1], &rl, &rr);
-		out[n * 2 + 0] = rl;
-		out[n * 2 + 1] = rr;
-	}
+	/* launch one thread per stem */
+	pthread_t *threads = calloc(nstem, sizeof(pthread_t));
+	for (int i = 0; i < nstem; i++)
+		pthread_create(&threads[i], NULL, stem_worker, &jobs[i]);
+	for (int i = 0; i < nstem; i++)
+		pthread_join(threads[i], NULL);
+	free(threads);
 
-	/* Normalize */
+	/* merge stem buffers + reverb + peak in one pass */
 	float peak = 0.0f;
-	for (int i = 0; i < max_frames * 2; i++) {
-		float a = fabsf(out[i]);
-		if (a > peak) peak = a;
+	for (int n = 0; n < max_frames; n++) {
+		float mix_l = 0.0f, mix_r = 0.0f;
+		for (int i = 0; i < nstem; i++) {
+			mix_l += jobs[i].buf[n * 2 + 0];
+			mix_r += jobs[i].buf[n * 2 + 1];
+		}
+
+		float rev_l, rev_r;
+		reverb_process(&reverb, mix_l, mix_r, &rev_l, &rev_r);
+
+		out[n * 2 + 0] = rev_l;
+		out[n * 2 + 1] = rev_r;
+
+		float al = fabsf(rev_l), ar = fabsf(rev_r);
+		if (al > peak) peak = al;
+		if (ar > peak) peak = ar;
 	}
+
+	for (int i = 0; i < nstem; i++)
+		free(jobs[i].buf);
+	free(jobs);
+
 	if (peak > 0.95f) {
 		float scale = 0.95f / peak;
 		for (int i = 0; i < max_frames * 2; i++)
