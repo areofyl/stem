@@ -1,4 +1,11 @@
 music/
+stemmed-*/
 spatialize
+spatialize_fft
+inference
 __pycache__/
 *.pt
+*.bin
+*.wav
+*.sofa
+hrtf/hrtf_data.h
