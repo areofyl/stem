@@ -10,6 +10,13 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
+
+#ifdef __aarch64__
+#include <arm_neon.h>
+#define USE_NEON 1
+#else
+#define USE_NEON 0
+#endif
 #include <string.h>
 #include <sndfile.h>
 
@@ -80,6 +87,45 @@ static inline __attribute__((always_inline)) float biquad_tick(Biquad *bq, float
 	bq->y2 = bq->y1; bq->y1 = y;
 	return y;
 }
+
+#if USE_NEON
+/*
+ * NEON biquad: process two biquads (L and R) in parallel using float32x2.
+ * both biquads must have the same coefficients (which they do for our
+ * paired L/R filters since they're initialized with the same params).
+ * even when coefficients differ (ILD makes gains different), this still
+ * works because we load each biquad's state separately into lanes.
+ */
+typedef struct {
+	float32x2_t b0, b1, b2, a1, a2;
+	float32x2_t x1, x2, y1, y2;
+} BiquadPair;
+
+static inline void biquad_pair_init(BiquadPair *bp, Biquad *l, Biquad *r)
+{
+	bp->b0 = (float32x2_t){ l->b0, r->b0 };
+	bp->b1 = (float32x2_t){ l->b1, r->b1 };
+	bp->b2 = (float32x2_t){ l->b2, r->b2 };
+	bp->a1 = (float32x2_t){ l->a1, r->a1 };
+	bp->a2 = (float32x2_t){ l->a2, r->a2 };
+	bp->x1 = bp->x2 = bp->y1 = bp->y2 = vdup_n_f32(0.0f);
+}
+
+static inline __attribute__((always_inline)) float32x2_t biquad_pair_tick(BiquadPair *bp, float32x2_t x)
+{
+	/* y = b0*x + b1*x1 + b2*x2 - a1*y1 - a2*y2
+	   all operations are 2-wide (L and R simultaneously) */
+	float32x2_t y = vmul_f32(bp->b0, x);
+	y = vfma_f32(y, bp->b1, bp->x1);
+	y = vfma_f32(y, bp->b2, bp->x2);
+	y = vfms_f32(y, bp->a1, bp->y1);
+	y = vfms_f32(y, bp->a2, bp->y2);
+
+	bp->x2 = bp->x1; bp->x1 = x;
+	bp->y2 = bp->y1; bp->y1 = y;
+	return y;
+}
+#endif
 
 /* ---- Fractional delay line for ITD ---- */
 typedef struct {
@@ -286,6 +332,13 @@ typedef struct {
 	Biquad shadow_l, shadow_r;
 	Biquad pinna_l[3], pinna_r[3];
 	Biquad bright_l, bright_r;
+#if USE_NEON
+	/* paired L/R biquads for NEON: shadow, pinna[3], bright = 5 pairs */
+	BiquadPair neon_shadow;
+	BiquadPair neon_pinna[3];
+	BiquadPair neon_bright;
+	float32x2_t neon_gain;
+#endif
 } BinauralState;
 
 /* Early reflection: a delayed, attenuated bounce from a different angle */
@@ -410,6 +463,15 @@ static void init_binaural(BinauralState *b, double az, double el, double sr)
 	double bright_db = (c >= 0.0) ? 4.0 * c : 3.0 * c;
 	biquad_hishelf(&b->bright_l, 3000.0, bright_db, sr);
 	biquad_hishelf(&b->bright_r, 3000.0, bright_db, sr);
+
+#if USE_NEON
+	/* pack L/R biquad pairs for NEON processing */
+	biquad_pair_init(&b->neon_shadow, &b->shadow_l, &b->shadow_r);
+	for (int i = 0; i < 3; i++)
+		biquad_pair_init(&b->neon_pinna[i], &b->pinna_l[i], &b->pinna_r[i]);
+	biquad_pair_init(&b->neon_bright, &b->bright_l, &b->bright_r);
+	b->neon_gain = (float32x2_t){ (float)b->gain_l, (float)b->gain_r };
+#endif
 }
 
 static void init_stem_binaurals(Stem *s, double sr)
@@ -461,6 +523,19 @@ static inline __attribute__((always_inline)) void process_binaural(BinauralState
 	float L = delay_read(&b->dl_left,  b->tap_l);
 	float R = delay_read(&b->dl_right, b->tap_r);
 
+#if USE_NEON
+	/* pack L/R into a 2-lane vector, run all 5 biquad pairs as SIMD.
+	   each vfma does both channels in one instruction. */
+	float32x2_t lr = (float32x2_t){ L, R };
+	lr = vmul_f32(lr, b->neon_gain);
+	lr = biquad_pair_tick(&b->neon_shadow, lr);
+	lr = biquad_pair_tick(&b->neon_pinna[0], lr);
+	lr = biquad_pair_tick(&b->neon_pinna[1], lr);
+	lr = biquad_pair_tick(&b->neon_pinna[2], lr);
+	lr = biquad_pair_tick(&b->neon_bright, lr);
+	*out_l = vget_lane_f32(lr, 0);
+	*out_r = vget_lane_f32(lr, 1);
+#else
 	L *= (float)b->gain_l;
 	R *= (float)b->gain_r;
 
@@ -477,6 +552,7 @@ static inline __attribute__((always_inline)) void process_binaural(BinauralState
 
 	*out_l = L;
 	*out_r = R;
+#endif
 }
 
 /* thread job for parallel stem processing */
