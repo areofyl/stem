@@ -9,7 +9,7 @@ spatialize: spatialize.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
 inference: inference.c
-	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+	$(CC) $(CFLAGS) -I/usr/include/openblas -o $@ $< $(LDFLAGS) -lopenblas
 
 install: all
 	install -Dm755 spatialize $(DESTDIR)$(PREFIX)/bin/spatialize

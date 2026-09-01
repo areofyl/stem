@@ -16,6 +16,7 @@
 #include <sndfile.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <cblas.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -27,13 +28,15 @@
 static void linear(float *y, const float *x, const float *w, const float *b,
                    int M, int K, int N)
 {
-	for (int i = 0; i < M; i++) {
-		for (int j = 0; j < N; j++) {
-			float sum = b ? b[j] : 0.0f;
-			for (int k = 0; k < K; k++)
-				sum += x[i * K + k] * w[j * K + k];
-			y[i * N + j] = sum;
-		}
+	/* y = x * W^T using OpenBLAS sgemm (heavily optimized for ARM NEON) */
+	cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+	            M, N, K, 1.0f, x, K, w, K, 0.0f, y, N);
+
+	/* add bias */
+	if (b) {
+		for (int i = 0; i < M; i++)
+			for (int j = 0; j < N; j++)
+				y[i * N + j] += b[j];
 	}
 }
 
@@ -99,33 +102,42 @@ static void multihead_attention(float *out, float *x, int seq, int emb, int n_he
 	float *K = qkv + seq * emb;
 	float *V = qkv + seq * 2 * emb;
 
-	/* per-head attention */
+	/* per-head attention using BLAS for the matmuls */
 	float *attn_out = calloc(seq * emb, sizeof(float));
 	float *scores = calloc(seq * seq, sizeof(float));
+	float *Q_head = calloc(seq * head_dim, sizeof(float));
+	float *K_head = calloc(seq * head_dim, sizeof(float));
+	float *V_head = calloc(seq * head_dim, sizeof(float));
+	float *A_head = calloc(seq * head_dim, sizeof(float));
 
 	for (int h = 0; h < n_heads; h++) {
 		int off = h * head_dim;
 
-		/* scores = Q @ K^T * scale */
-		for (int i = 0; i < seq; i++)
-			for (int j = 0; j < seq; j++) {
-				float s = 0;
-				for (int k = 0; k < head_dim; k++)
-					s += Q[i * emb + off + k] * K[j * emb + off + k];
-				scores[i * seq + j] = s * scale;
-			}
+		/* extract head slices (strided -> contiguous) */
+		for (int i = 0; i < seq; i++) {
+			memcpy(Q_head + i * head_dim, Q + i * emb + off, head_dim * sizeof(float));
+			memcpy(K_head + i * head_dim, K + i * emb + off, head_dim * sizeof(float));
+			memcpy(V_head + i * head_dim, V + i * emb + off, head_dim * sizeof(float));
+		}
+
+		/* scores = Q_head @ K_head^T * scale */
+		cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+		            seq, seq, head_dim, scale, Q_head, head_dim, K_head, head_dim,
+		            0.0f, scores, seq);
 
 		softmax(scores, seq, seq);
 
-		/* weighted sum of values */
+		/* A_head = scores @ V_head */
+		cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+		            seq, head_dim, seq, 1.0f, scores, seq, V_head, head_dim,
+		            0.0f, A_head, head_dim);
+
+		/* scatter back */
 		for (int i = 0; i < seq; i++)
-			for (int k = 0; k < head_dim; k++) {
-				float s = 0;
-				for (int j = 0; j < seq; j++)
-					s += scores[i * seq + j] * V[j * emb + off + k];
-				attn_out[i * emb + off + k] = s;
-			}
+			memcpy(attn_out + i * emb + off, A_head + i * head_dim, head_dim * sizeof(float));
 	}
+
+	free(Q_head); free(K_head); free(V_head); free(A_head);
 
 	/* output projection */
 	linear(out, attn_out, out_proj_w, out_proj_b, seq, emb, emb);
