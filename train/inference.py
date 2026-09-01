@@ -20,6 +20,10 @@ def main():
     checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
     config = checkpoint['config']
 
+    # 4 threads is faster than 8 for small models (less sync overhead)
+    torch.set_num_threads(4)
+    torch.set_grad_enabled(False)
+
     model = make_model(config['size'])
 
     # torch.compile prefixes keys with _orig_mod., strip it for loading
@@ -28,16 +32,17 @@ def main():
     model.load_state_dict(state)
     model.eval()
 
-    # convert to 44100Hz wav first if needed
-    import subprocess, tempfile
-    tmp_wav = os.path.join(tempfile.gettempdir(), 'stem_inference_input.wav')
-    subprocess.run([
-        'ffmpeg', '-y', '-i', input_path,
-        '-ar', str(config['sample_rate']), '-ac', '2', tmp_wav
-    ], capture_output=True)
-
-    audio, sr = sf.read(tmp_wav, dtype='float32', always_2d=True)
-    os.remove(tmp_wav)
+    # read audio, convert sample rate if needed
+    audio, sr = sf.read(input_path, dtype='float32', always_2d=True)
+    if sr != config['sample_rate']:
+        import subprocess, tempfile
+        tmp_wav = os.path.join(tempfile.gettempdir(), 'stem_inference_input.wav')
+        subprocess.run([
+            'ffmpeg', '-y', '-i', input_path,
+            '-ar', str(config['sample_rate']), '-ac', '2', tmp_wav
+        ], capture_output=True)
+        audio, sr = sf.read(tmp_wav, dtype='float32', always_2d=True)
+        os.remove(tmp_wav)
     audio = torch.from_numpy(audio.T)
 
     duration = audio.shape[1] / config['sample_rate']
