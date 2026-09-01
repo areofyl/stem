@@ -6,18 +6,22 @@
 # ./stem -t 0 song.mp3                   full track
 # ./stem --theater song.mp3              6-stem theater layout
 # ./stem --glue 50 song.mp3              blend 50% original mix in
+# ./stem --glue auto song.mp3            auto-detect how much glue to use
+# ./stem --model best.pt song.mp3        use custom trained model
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SPATIALIZE="$SCRIPT_DIR/spatialize"
 FAST_SEP="$SCRIPT_DIR/fast_separate.py"
+AUTOGLUE="$SCRIPT_DIR/autoglue.py"
 
 DURATION=60
 MODEL=htdemucs_ft
 PRESET=default
 QUALITY=fast
-GLUE=0
+GLUE=auto
+CUSTOM_MODEL=""
 
 die() { printf "error: %s\n" "$1" >&2; exit 1; }
 
@@ -30,12 +34,13 @@ while [ $# -gt 0 ]; do
 		-q) QUALITY=quality; shift ;;
 		--theater) PRESET=theater; shift ;;
 		--glue) GLUE="$2"; shift 2 ;;
+		--model) CUSTOM_MODEL="$2"; shift 2 ;;
 		-*) die "unknown flag: $1" ;;
 		*)  break ;;
 	esac
 done
 
-[ $# -lt 1 ] && die "usage: stem [-t sec] [-q] [--theater] [--glue N] input [output.wav]"
+[ $# -lt 1 ] && die "usage: stem [-t sec] [-q] [--theater] [--glue N|auto] [--model file.pt] input [output.wav]"
 
 INPUT="$1"
 [ -f "$INPUT" ] || die "file not found: $INPUT"
@@ -53,21 +58,19 @@ STEMDIR="$WORKDIR/stems"
 # theater needs 6-stem model
 [ "$PRESET" = "theater" ] && MODEL=htdemucs_6s
 
-# show what we're doing
+# show config (glue shown later if auto)
 DUR_STR="full track"
 [ "$DURATION" -gt 0 ] 2>/dev/null && DUR_STR="${DURATION}s"
-GLUE_STR="off"
-[ "$GLUE" -gt 0 ] 2>/dev/null && GLUE_STR="${GLUE}%"
-if [ "$QUALITY" = "fast" ]; then
-	QUANT_STR="float32 (1 of 4 models)"
+if [ -n "$CUSTOM_MODEL" ]; then
+	MODEL_STR="custom ($(basename "$CUSTOM_MODEL"))"
+elif [ "$QUALITY" = "fast" ]; then
+	MODEL_STR="htdemucs_ft (1 of 4 models)"
 else
-	QUANT_STR="float32 (full bag, 4 models)"
+	MODEL_STR="htdemucs_ft (full bag, 4 models)"
 fi
 echo "   duration: $DUR_STR"
-echo "   model: $MODEL"
-echo "   quantization: $QUANT_STR"
+echo "   model: $MODEL_STR"
 echo "   preset: $PRESET"
-echo "   glue: $GLUE_STR"
 echo ""
 
 # convert to wav, trim if needed
@@ -80,24 +83,44 @@ DEMUCS_INPUT="$WORKDIR/input.wav"
 
 echo " separating stems"
 
-if [ "$QUALITY" = "quality" ]; then
+if [ -n "$CUSTOM_MODEL" ]; then
+	[ -f "$CUSTOM_MODEL" ] || die "model not found: $CUSTOM_MODEL"
+	python3 "$SCRIPT_DIR/train/inference.py" "$CUSTOM_MODEL" "$DEMUCS_INPUT" "$STEMDIR"
+elif [ "$QUALITY" = "quality" ]; then
 	command -v demucs >/dev/null 2>&1 || die "demucs not found"
 	OMP_NUM_THREADS=8 demucs -n "$MODEL" "$DEMUCS_INPUT" -o "$WORKDIR/demucs_out"
 	DEMUCS_BASENAME="$(basename "$DEMUCS_INPUT" | sed 's/\.[^.]*$//')"
 	STEMDIR="$WORKDIR/demucs_out/$MODEL/$DEMUCS_BASENAME"
 else
-	OMP_NUM_THREADS=8 AURIS_MODEL="$MODEL" python3 "$FAST_SEP" "$DEMUCS_INPUT" "$STEMDIR"
+	OMP_NUM_THREADS=8 STEM_MODEL="$MODEL" python3 "$FAST_SEP" "$DEMUCS_INPUT" "$STEMDIR"
 fi
 
 [ -d "$STEMDIR" ] || die "stems not found at $STEMDIR"
 
-# keep a copy of the stems
+# per-stem EQ: brighten vocals, clean up bass bleed
+echo " applying stem EQ"
+if [ -f "$STEMDIR/vocals.wav" ]; then
+	ffmpeg -y -i "$STEMDIR/vocals.wav" -af "highshelf=f=3000:g=3.5" "$STEMDIR/vocals_eq.wav" 2>/dev/null
+	mv "$STEMDIR/vocals_eq.wav" "$STEMDIR/vocals.wav"
+fi
+if [ -f "$STEMDIR/bass.wav" ]; then
+	ffmpeg -y -i "$STEMDIR/bass.wav" -af "lowpass=f=300:p=2" "$STEMDIR/bass_eq.wav" 2>/dev/null
+	mv "$STEMDIR/bass_eq.wav" "$STEMDIR/bass.wav"
+fi
+
+# keep a copy of the stems (after EQ)
 SAVE_STEMS="stemmed-$BASENAME"
 mkdir -p "$SAVE_STEMS"
 cp "$STEMDIR"/*.wav "$SAVE_STEMS/"
 echo " stems saved to $SAVE_STEMS/"
 
-# glue: mix original back in at center to mask artifacts
+# auto-detect glue amount if requested
+if [ "$GLUE" = "auto" ]; then
+	GLUE=$(python3 "$AUTOGLUE" "$DEMUCS_INPUT" "$STEMDIR")
+	echo " auto-glue: ${GLUE}%"
+fi
+
+# compute glue gain
 GLUE_ARG=""
 if [ "$GLUE" -gt 0 ] 2>/dev/null; then
 	GLUE_DB=$(python3 -c "import math; print(f'{20*math.log10($GLUE/100):.1f}')")
