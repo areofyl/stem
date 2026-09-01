@@ -22,6 +22,37 @@
 #define M_PI 3.14159265358979323846
 #endif
 
+/* ---- arena allocator ---- */
+
+typedef struct {
+	char *base;
+	size_t used, capacity;
+} Arena;
+
+static Arena arena_create(size_t cap)
+{
+	Arena a = { .base = malloc(cap), .used = 0, .capacity = cap };
+	return a;
+}
+
+static void *arena_alloc(Arena *a, size_t bytes)
+{
+	bytes = (bytes + 15) & ~(size_t)15;
+	if (a->used + bytes > a->capacity) {
+		fprintf(stderr, "arena OOM: need %zu, have %zu/%zu\n", bytes, a->used, a->capacity);
+		exit(1);
+	}
+	void *p = a->base + a->used;
+	a->used += bytes;
+	memset(p, 0, bytes);
+	return p;
+}
+
+static void arena_reset(Arena *a) { a->used = 0; }
+static void arena_destroy(Arena *a) { free(a->base); }
+
+static Arena scratch;
+
 /* ---- basic tensor ops ---- */
 
 /* y = x @ W^T + b  (x: [M,K], W: [N,K], b: [N], y: [M,N]) */
@@ -95,7 +126,7 @@ static void multihead_attention(float *out, float *x, int seq, int emb, int n_he
 	float scale = 1.0f / sqrtf((float)head_dim);
 
 	/* QKV projection: [seq, emb] @ [3*emb, emb]^T = [seq, 3*emb] */
-	float *qkv = calloc(seq * 3 * emb, sizeof(float));
+	float *qkv = arena_alloc(&scratch, seq * 3 * emb * sizeof(float));
 	linear(qkv, x, in_proj_w, in_proj_b, seq, emb, 3 * emb);
 
 	float *Q = qkv;
@@ -103,12 +134,12 @@ static void multihead_attention(float *out, float *x, int seq, int emb, int n_he
 	float *V = qkv + seq * 2 * emb;
 
 	/* per-head attention using BLAS for the matmuls */
-	float *attn_out = calloc(seq * emb, sizeof(float));
-	float *scores = calloc(seq * seq, sizeof(float));
-	float *Q_head = calloc(seq * head_dim, sizeof(float));
-	float *K_head = calloc(seq * head_dim, sizeof(float));
-	float *V_head = calloc(seq * head_dim, sizeof(float));
-	float *A_head = calloc(seq * head_dim, sizeof(float));
+	float *attn_out = arena_alloc(&scratch, seq * emb * sizeof(float));
+	float *scores = arena_alloc(&scratch, seq * seq * sizeof(float));
+	float *Q_head = arena_alloc(&scratch, seq * head_dim * sizeof(float));
+	float *K_head = arena_alloc(&scratch, seq * head_dim * sizeof(float));
+	float *V_head = arena_alloc(&scratch, seq * head_dim * sizeof(float));
+	float *A_head = arena_alloc(&scratch, seq * head_dim * sizeof(float));
 
 	for (int h = 0; h < n_heads; h++) {
 		int off = h * head_dim;
@@ -137,14 +168,10 @@ static void multihead_attention(float *out, float *x, int seq, int emb, int n_he
 			memcpy(attn_out + i * emb + off, A_head + i * head_dim, head_dim * sizeof(float));
 	}
 
-	free(Q_head); free(K_head); free(V_head); free(A_head);
 
 	/* output projection */
 	linear(out, attn_out, out_proj_w, out_proj_b, seq, emb, emb);
 
-	free(qkv);
-	free(attn_out);
-	free(scores);
 }
 
 /* ---- FFT (same radix-2 as spatialize_fft.c) ---- */
@@ -192,7 +219,7 @@ static void stft(const float *input, int n_samples, int n_fft, int hop,
 	int frames = (n_samples - n_fft) / hop + 1;
 	*out_frames = frames;
 
-	cpx *buf = calloc(n_fft, sizeof(cpx));
+	cpx *buf = arena_alloc(&scratch, n_fft * sizeof(cpx));
 
 	for (int t = 0; t < frames; t++) {
 		int start = t * hop;
@@ -204,7 +231,6 @@ static void stft(const float *input, int n_samples, int n_fft, int hop,
 			out_imag[f * frames + t] = buf[f].im;
 		}
 	}
-	free(buf);
 }
 
 /* ISTFT: input [freq_bins, frames, 2], output [samples] */
@@ -212,8 +238,8 @@ static void istft(const float *in_real, const float *in_imag, int n_bins, int fr
                  int n_fft, int hop, const float *window, float *output, int n_samples)
 {
 	memset(output, 0, n_samples * sizeof(float));
-	float *win_sum = calloc(n_samples, sizeof(float));
-	cpx *buf = calloc(n_fft, sizeof(cpx));
+	float *win_sum = arena_alloc(&scratch, n_samples * sizeof(float));
+	cpx *buf = arena_alloc(&scratch, n_fft * sizeof(cpx));
 
 	for (int t = 0; t < frames; t++) {
 		/* load spectrum */
@@ -235,8 +261,6 @@ static void istft(const float *in_real, const float *in_imag, int n_bins, int fr
 	for (int i = 0; i < n_samples; i++)
 		if (win_sum[i] > 1e-8f) output[i] /= win_sum[i];
 
-	free(win_sum);
-	free(buf);
 }
 
 /* ---- model weight loading ---- */
@@ -360,6 +384,8 @@ static Model *load_model(const char *path)
 static void forward_chunk(Model *m, const float *input_l, const float *input_r,
                           int n_samples, float **out_sources)
 {
+	arena_reset(&scratch);
+
 	int n_fft = m->n_fft;
 	int hop = m->hop_length;
 	int n_bins = n_fft / 2 + 1;
@@ -374,26 +400,25 @@ static void forward_chunk(Model *m, const float *input_l, const float *input_r,
 
 	/* STFT both channels */
 	int T;
-	float *spec_lr = calloc(2 * n_bins * 1, sizeof(float)); /* placeholder */
+	float *spec_lr = arena_alloc(&scratch, 2 * n_bins * 1 * sizeof(float)); /* placeholder */
 	float *ch_real[2], *ch_imag[2];
 	for (int c = 0; c < 2; c++) {
 		const float *ch_in = (c == 0) ? input_l : input_r;
-		ch_real[c] = calloc(n_bins * ((n_samples - n_fft) / hop + 1), sizeof(float));
-		ch_imag[c] = calloc(n_bins * ((n_samples - n_fft) / hop + 1), sizeof(float));
+		ch_real[c] = arena_alloc(&scratch, n_bins * ((n_samples - n_fft) / hop + 1) * sizeof(float));
+		ch_imag[c] = arena_alloc(&scratch, n_bins * ((n_samples - n_fft) / hop + 1) * sizeof(float));
 		stft(ch_in, n_samples, n_fft, hop, window, ch_real[c], ch_imag[c], &T);
 	}
-	free(spec_lr);
 
 	/* band_split: for each band, gather [ch0_real, ch0_imag, ch1_real, ch1_imag]
 	   input to each band projection: (T, band_size * 4) */
-	float *bands_out = calloc(n_bands * T * emb, sizeof(float));
+	float *bands_out = arena_alloc(&scratch, n_bands * T * emb * sizeof(float));
 
 	for (int b = 0; b < n_bands; b++) {
 		int start = m->band_starts[b], end = m->band_ends[b];
 		int bsz = end - start;
 		int in_dim = bsz * 4; /* 2 channels * 2 (real/imag) */
 
-		float *band_in = calloc(T * in_dim, sizeof(float));
+		float *band_in = arena_alloc(&scratch, T * in_dim * sizeof(float));
 		for (int t = 0; t < T; t++) {
 			float *row = band_in + t * in_dim;
 			int off = 0;
@@ -412,18 +437,18 @@ static void forward_chunk(Model *m, const float *input_l, const float *input_r,
 		linear(band_out, band_in, m->bs_w[b], m->bs_b[b], T, in_dim, emb);
 		gelu(band_out, T * emb);
 
-		free(band_in);
 	}
 
 	/* interleaved attention: bands_out is [n_bands, T, emb] (contiguous per band) */
 	float *x = bands_out; /* [n_bands * T * emb] */
 
 	for (int l = 0; l < m->n_layers; l++) {
+		size_t layer_mark = scratch.used; /* reclaim after each layer */
+
 		/* --- band attention (at each time step, attend across bands) --- */
-		/* reshape to [T, n_bands, emb], process each time step */
-		float *resid = calloc(n_bands * T * emb, sizeof(float));
-		float *normed = calloc(n_bands * emb, sizeof(float));
-		float *attn_out = calloc(n_bands * emb, sizeof(float));
+		float *resid = arena_alloc(&scratch, n_bands * T * emb * sizeof(float));
+		float *normed = arena_alloc(&scratch, n_bands * emb * sizeof(float));
+		float *attn_out = arena_alloc(&scratch, n_bands * emb * sizeof(float));
 
 		for (int t = 0; t < T; t++) {
 			/* gather bands for this time step: x[b][t] for all b */
@@ -445,25 +470,23 @@ static void forward_chunk(Model *m, const float *input_l, const float *input_r,
 		memcpy(x, resid, n_bands * T * emb * sizeof(float));
 
 		/* band feedforward with residual */
-		float *ff_in = calloc(n_bands * T * emb, sizeof(float));
+		float *ff_in = arena_alloc(&scratch, n_bands * T * emb * sizeof(float));
 		memcpy(ff_in, x, n_bands * T * emb * sizeof(float));
 		layer_norm(ff_in, m->band_ff_norm_g[l], m->band_ff_norm_b[l], n_bands * T, emb);
 
-		float *ff_mid = calloc(n_bands * T * emb * 2, sizeof(float));
+		float *ff_mid = arena_alloc(&scratch, n_bands * T * emb * 2 * sizeof(float));
 		linear(ff_mid, ff_in, m->band_ff_w1[l], m->band_ff_b1[l], n_bands * T, emb, emb * 2);
 		gelu(ff_mid, n_bands * T * emb * 2);
-		float *ff_out = calloc(n_bands * T * emb, sizeof(float));
+		float *ff_out = arena_alloc(&scratch, n_bands * T * emb * sizeof(float));
 		linear(ff_out, ff_mid, m->band_ff_w2[l], m->band_ff_b2[l], n_bands * T, emb * 2, emb);
 
 		for (int i = 0; i < n_bands * T * emb; i++) x[i] += ff_out[i];
 
-		free(resid); free(normed); free(attn_out);
-		free(ff_in); free(ff_mid); free(ff_out);
 
 		/* --- time attention (for each band, attend across time) --- */
-		resid = calloc(n_bands * T * emb, sizeof(float));
-		normed = calloc(T * emb, sizeof(float));
-		attn_out = calloc(T * emb, sizeof(float));
+		resid = arena_alloc(&scratch, n_bands * T * emb * sizeof(float));
+		normed = arena_alloc(&scratch, T * emb * sizeof(float));
+		attn_out = arena_alloc(&scratch, T * emb * sizeof(float));
 
 		for (int b = 0; b < n_bands; b++) {
 			float *band_data = x + b * T * emb;
@@ -479,35 +502,34 @@ static void forward_chunk(Model *m, const float *input_l, const float *input_r,
 		memcpy(x, resid, n_bands * T * emb * sizeof(float));
 
 		/* time feedforward with residual */
-		ff_in = calloc(n_bands * T * emb, sizeof(float));
+		ff_in = arena_alloc(&scratch, n_bands * T * emb * sizeof(float));
 		memcpy(ff_in, x, n_bands * T * emb * sizeof(float));
 		layer_norm(ff_in, m->time_ff_norm_g[l], m->time_ff_norm_b[l], n_bands * T, emb);
 
-		ff_mid = calloc(n_bands * T * emb * 2, sizeof(float));
+		ff_mid = arena_alloc(&scratch, n_bands * T * emb * 2 * sizeof(float));
 		linear(ff_mid, ff_in, m->time_ff_w1[l], m->time_ff_b1[l], n_bands * T, emb, emb * 2);
 		gelu(ff_mid, n_bands * T * emb * 2);
-		ff_out = calloc(n_bands * T * emb, sizeof(float));
+		ff_out = arena_alloc(&scratch, n_bands * T * emb * sizeof(float));
 		linear(ff_out, ff_mid, m->time_ff_w2[l], m->time_ff_b2[l], n_bands * T, emb * 2, emb);
 
 		for (int i = 0; i < n_bands * T * emb; i++) x[i] += ff_out[i];
 
-		free(resid); free(normed); free(attn_out);
-		free(ff_in); free(ff_mid); free(ff_out);
+		scratch.used = layer_mark; /* reclaim all layer scratch */
 	}
 
 	/* band_merge: project back to spectrogram masks */
 	/* for each band, project [T, emb] -> [T, band_size * n_channels * 2 * n_sources] */
 	/* then sigmoid */
 	/* masks layout: [n_sources][2 channels][2 ri][freq][T] */
-	float *masks_real = calloc(n_sources * 2 * n_bins * T, sizeof(float));
-	float *masks_imag = calloc(n_sources * 2 * n_bins * T, sizeof(float));
+	float *masks_real = arena_alloc(&scratch, n_sources * 2 * n_bins * T * sizeof(float));
+	float *masks_imag = arena_alloc(&scratch, n_sources * 2 * n_bins * T * sizeof(float));
 
 	for (int b = 0; b < n_bands; b++) {
 		int start = m->band_starts[b], end = m->band_ends[b];
 		int bsz = end - start;
 		int out_dim = bsz * 2 * 2 * n_sources; /* band_size * channels * ri * sources */
 
-		float *proj_out = calloc(T * out_dim, sizeof(float));
+		float *proj_out = arena_alloc(&scratch, T * out_dim * sizeof(float));
 		linear(proj_out, x + b * T * emb, m->bm_w[b], m->bm_b[b], T, emb, out_dim);
 		sigmoid(proj_out, T * out_dim);
 
@@ -529,15 +551,14 @@ static void forward_chunk(Model *m, const float *input_l, const float *input_r,
 					}
 				}
 		}
-		free(proj_out);
 	}
 
 	/* apply masks: out = orig * mask (complex multiply using real arithmetic) */
 	for (int s = 0; s < n_sources; s++) {
 		for (int c = 0; c < 2; c++) {
 			int si = (s * 2 + c) * n_bins * T;
-			float *src_real = calloc(n_bins * T, sizeof(float));
-			float *src_imag = calloc(n_bins * T, sizeof(float));
+			float *src_real = arena_alloc(&scratch, n_bins * T * sizeof(float));
+			float *src_imag = arena_alloc(&scratch, n_bins * T * sizeof(float));
 
 			for (int i = 0; i < n_bins * T; i++) {
 				float or_ = (c == 0) ? ch_real[0][i] : ch_real[1][i];
@@ -552,17 +573,9 @@ static void forward_chunk(Model *m, const float *input_l, const float *input_r,
 			istft(src_real, src_imag, n_bins, T, n_fft, hop, window,
 			      out_sources[s * 2 + c], n_samples);
 
-			free(src_real);
-			free(src_imag);
 		}
 	}
 
-	free(masks_real);
-	free(masks_imag);
-	free(ch_real[0]); free(ch_real[1]);
-	free(ch_imag[0]); free(ch_imag[1]);
-	free(bands_out);
-	free(window);
 }
 
 /* ---- main ---- */
@@ -580,6 +593,10 @@ int main(int argc, char **argv)
 
 	mkdir(output_dir, 0755);
 
+	/* two arenas: persistent (audio, output) and scratch (per-chunk, reset between chunks) */
+	scratch = arena_create((size_t)2 * 1024 * 1024 * 1024); /* 2GB scratch */
+	Arena persist = arena_create((size_t)1024 * 1024 * 1024); /* 1GB persistent */
+
 	printf("loading model...\n");
 	Model *m = load_model(model_path);
 	if (!m) return 1;
@@ -592,36 +609,104 @@ int main(int argc, char **argv)
 	if (!sf) { fprintf(stderr, "can't open %s\n", input_path); return 1; }
 
 	int n_samples = (int)info.frames;
-	float *audio_l = calloc(n_samples, sizeof(float));
-	float *audio_r = calloc(n_samples, sizeof(float));
+	float *audio_l = arena_alloc(&persist, n_samples * sizeof(float));
+	float *audio_r = arena_alloc(&persist, n_samples * sizeof(float));
 
 	if (info.channels == 1) {
 		sf_readf_float(sf, audio_l, n_samples);
 		memcpy(audio_r, audio_l, n_samples * sizeof(float));
 	} else {
-		float *tmp = calloc(n_samples * info.channels, sizeof(float));
+		float *tmp = arena_alloc(&persist, n_samples * info.channels * sizeof(float));
 		sf_readf_float(sf, tmp, n_samples);
 		for (int i = 0; i < n_samples; i++) {
 			audio_l[i] = tmp[i * info.channels];
 			audio_r[i] = tmp[i * info.channels + 1];
 		}
-		free(tmp);
 	}
 	sf_close(sf);
 
 	float duration = (float)n_samples / m->sample_rate;
 	printf("separating %.1fs of audio...\n", duration);
 
-	/* allocate output: n_sources * 2 channels */
 	int n_out = m->n_sources * 2;
 	float **out = calloc(n_out, sizeof(float *));
 	for (int i = 0; i < n_out; i++)
-		out[i] = calloc(n_samples, sizeof(float));
+		out[i] = arena_alloc(&persist, n_samples * sizeof(float));
 
 	struct timespec t0, t1;
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 
-	forward_chunk(m, audio_l, audio_r, n_samples, out);
+	/* chunked overlap-add: process in 10s chunks with 1s overlap */
+	int chunk_samples = m->sample_rate * 10;
+	int overlap_samples = m->sample_rate * 1;
+	int stride = chunk_samples - overlap_samples;
+
+	/* triangular crossfade window for overlap region */
+	float *xfade_up = arena_alloc(&persist, overlap_samples * sizeof(float));
+	float *xfade_down = arena_alloc(&persist, overlap_samples * sizeof(float));
+	for (int i = 0; i < overlap_samples; i++) {
+		xfade_up[i] = (float)i / overlap_samples;
+		xfade_down[i] = 1.0f - xfade_up[i];
+	}
+
+	int total_chunks = 0;
+	for (int p = 0; p < n_samples; p += stride) total_chunks++;
+
+	int chunk_i = 0;
+	for (int pos = 0; pos < n_samples; pos += stride) {
+		int end = pos + chunk_samples;
+		if (end > n_samples) end = n_samples;
+		int len = end - pos;
+
+		/* extract chunk */
+		float *chunk_l = calloc(chunk_samples, sizeof(float));
+		float *chunk_r = calloc(chunk_samples, sizeof(float));
+		memcpy(chunk_l, audio_l + pos, len * sizeof(float));
+		memcpy(chunk_r, audio_r + pos, len * sizeof(float));
+
+		/* process chunk */
+		float **chunk_out = calloc(n_out, sizeof(float *));
+		for (int i = 0; i < n_out; i++)
+			chunk_out[i] = calloc(chunk_samples, sizeof(float));
+
+		forward_chunk(m, chunk_l, chunk_r, (len < chunk_samples) ? chunk_samples : len, chunk_out);
+
+		/* overlap-add into output with crossfade */
+		for (int i = 0; i < n_out; i++) {
+			for (int s = 0; s < len; s++) {
+				int out_pos = pos + s;
+				if (out_pos >= n_samples) break;
+
+				float sample = chunk_out[i][s];
+
+				/* crossfade in overlap region at the start of this chunk */
+				if (pos > 0 && s < overlap_samples)
+					sample *= xfade_up[s];
+
+				/* crossfade at the end of previous chunk's overlap */
+				if (pos > 0 && s < overlap_samples)
+					out[i][out_pos] *= xfade_down[s];
+
+				if (pos > 0 && s < overlap_samples)
+					out[i][out_pos] += sample;
+				else
+					out[i][out_pos] = sample;
+			}
+		}
+
+		for (int i = 0; i < n_out; i++) free(chunk_out[i]);
+		free(chunk_out);
+		free(chunk_l);
+		free(chunk_r);
+
+		chunk_i++;
+		fprintf(stderr, "  chunk %d/%d\n", chunk_i, total_chunks);
+		fflush(stdout);
+
+		if (end >= n_samples) break;
+	}
+	printf("\n");
+
 
 	clock_gettime(CLOCK_MONOTONIC, &t1);
 	float elapsed = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9f;
@@ -633,7 +718,7 @@ int main(int argc, char **argv)
 		char path[512];
 		snprintf(path, sizeof(path), "%s/%s.wav", output_dir, source_names[s]);
 
-		float *stereo = calloc(n_samples * 2, sizeof(float));
+		float *stereo = arena_alloc(&persist, n_samples * 2 * sizeof(float));
 		for (int i = 0; i < n_samples; i++) {
 			stereo[i * 2 + 0] = out[s * 2 + 0][i];
 			stereo[i * 2 + 1] = out[s * 2 + 1][i];
@@ -649,14 +734,12 @@ int main(int argc, char **argv)
 			sf_close(out_sf);
 			printf("  saved %s\n", source_names[s]);
 		}
-		free(stereo);
 	}
 
 	/* cleanup */
-	free(audio_l); free(audio_r);
-	for (int i = 0; i < n_out; i++) free(out[i]);
 	free(out);
-	/* model cleanup omitted for brevity */
+	arena_destroy(&persist);
+	arena_destroy(&scratch);
 
 	return 0;
 }
