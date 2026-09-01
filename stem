@@ -12,9 +12,11 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-SPATIALIZE="$SCRIPT_DIR/spatialize"
-FAST_SEP="$SCRIPT_DIR/fast_separate.py"
-AUTOGLUE="$SCRIPT_DIR/autoglue.py"
+LIB_DIR="${SCRIPT_DIR}"
+[ -d "/usr/local/lib/stem" ] && LIB_DIR="/usr/local/lib/stem"
+SPATIALIZE="$(command -v spatialize 2>/dev/null || echo "$SCRIPT_DIR/spatialize")"
+FAST_SEP="$LIB_DIR/fast_separate.py"
+AUTOGLUE="$LIB_DIR/autoglue.py"
 
 DURATION=60
 MODEL=htdemucs_ft
@@ -97,16 +99,11 @@ fi
 
 [ -d "$STEMDIR" ] || die "stems not found at $STEMDIR"
 
-# per-stem EQ: brighten vocals, clean up bass bleed
+# per-stem EQ: brighten vocals, clean up bass bleed (parallel)
 echo " applying stem EQ"
-if [ -f "$STEMDIR/vocals.wav" ]; then
-	ffmpeg -y -i "$STEMDIR/vocals.wav" -af "highshelf=f=3000:g=3.5" "$STEMDIR/vocals_eq.wav" 2>/dev/null
-	mv "$STEMDIR/vocals_eq.wav" "$STEMDIR/vocals.wav"
-fi
-if [ -f "$STEMDIR/bass.wav" ]; then
-	ffmpeg -y -i "$STEMDIR/bass.wav" -af "lowpass=f=300:p=2" "$STEMDIR/bass_eq.wav" 2>/dev/null
-	mv "$STEMDIR/bass_eq.wav" "$STEMDIR/bass.wav"
-fi
+([ -f "$STEMDIR/vocals.wav" ] && ffmpeg -y -i "$STEMDIR/vocals.wav" -af "highshelf=f=3000:g=3.5" "$STEMDIR/vocals_eq.wav" 2>/dev/null && mv "$STEMDIR/vocals_eq.wav" "$STEMDIR/vocals.wav") &
+([ -f "$STEMDIR/bass.wav" ] && ffmpeg -y -i "$STEMDIR/bass.wav" -af "lowpass=f=300:p=2" "$STEMDIR/bass_eq.wav" 2>/dev/null && mv "$STEMDIR/bass_eq.wav" "$STEMDIR/bass.wav") &
+wait
 
 # keep a copy of the stems (after EQ)
 SAVE_STEMS="stemmed-$BASENAME"
