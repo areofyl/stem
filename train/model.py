@@ -289,7 +289,18 @@ class StemSeparator(nn.Module):
         win[:overlap] = ramp
         win[-overlap:] = ramp.flip(0)
 
+        # count total chunks for progress
+        total_chunks = 0
+        p = 0
+        while p < L:
+            p += stride
+            total_chunks += 1
+            if p + chunk >= L:
+                total_chunks += 1
+                break
+
         pos = 0
+        chunk_i = 0
         while pos < L:
             end = min(pos + chunk, L)
             start = end - chunk if end == L and end - pos < chunk else pos
@@ -297,20 +308,25 @@ class StemSeparator(nn.Module):
 
             chunk_audio = mix_audio[:, start:end]
             if chunk_audio.shape[1] < chunk:
-                # pad last chunk
                 pad = chunk - chunk_audio.shape[1]
                 chunk_audio = F.pad(chunk_audio, (0, pad))
 
-            result = self.forward_chunk(chunk_audio.unsqueeze(0))[0]  # (sources, 2, chunk)
+            result = self.forward_chunk(chunk_audio.unsqueeze(0))[0]
             result = result[:, :, :actual_len]
 
             w = win[:actual_len]
             output[:, :, start:end] += result * w.unsqueeze(0).unsqueeze(0)
             weight[start:end] += w
 
+            chunk_i += 1
+            pct = int(chunk_i / total_chunks * 100)
+            print(f'\r  separating: {pct}%', end='', flush=True)
+
             pos += stride
             if end == L:
                 break
+
+        print('\r  separating: done')
 
         # normalize by overlap weights
         weight = weight.clamp(min=1e-8)
