@@ -6,7 +6,6 @@
 
 import argparse, os, time, math, random
 import torch
-import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 import soundfile as sf
 import numpy as np
@@ -37,16 +36,14 @@ class StemDataset(Dataset):
 
     def load(self, path):
         a, _ = sf.read(str(path), dtype='float32', always_2d=True)
-        return a.mean(axis=1)  # mono
+        return a.mean(axis=1)
 
     def __getitem__(self, idx):
         song = self.songs[idx % len(self.songs)]
 
-        # load mix and target
         mix = self.load(song / 'mix.wav')
         target = self.load(song / f'{self.target}.wav')
 
-        # random chunk
         if len(mix) > self.chunk:
             start = random.randint(0, len(mix) - self.chunk)
             mix = mix[start:start+self.chunk]
@@ -56,12 +53,10 @@ class StemDataset(Dataset):
             target = np.pad(target, (0, self.chunk - len(target)))
 
         if self.augment:
-            # random gain
             gain = 10 ** (random.uniform(-6, 6) / 20)
             mix = mix * gain
             target = target * gain
 
-            # remix: rebuild mix from random stems (50% chance)
             if random.random() < 0.5:
                 donor = random.choice(self.songs)
                 new_mix = np.zeros_like(mix)
@@ -112,14 +107,23 @@ def main():
     parser.add_argument('--target', required=True, choices=SOURCES)
     parser.add_argument('--output', default='./checkpoints')
     parser.add_argument('--epochs', type=int, default=100)
-    parser.add_argument('--batch_size', type=int, default=16)
+    parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--lr', type=float, default=3e-4)
     args = parser.parse_args()
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    use_amp = device == 'cuda'
+    n_workers = min(os.cpu_count() // 2, 16) if os.cpu_count() else 4
     print(f'training micro separator for: {args.target} ({device})')
+    if use_amp:
+        print('  bfloat16 mixed precision')
 
     model = make_model().to(device)
+
+    if device == 'cuda' and hasattr(torch, 'compile'):
+        print('  compiling model...')
+        model = torch.compile(model)
+
     if device == 'cpu':
         torch.set_num_threads(8)
 
@@ -127,10 +131,13 @@ def main():
     train_set = StemDataset(args.data, args.target, songs=train_songs)
     val_set = StemDataset(args.data, args.target, songs=val_songs, augment=False)
 
-    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=4, drop_last=True)
-    val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=2)
+    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True,
+                              num_workers=n_workers, pin_memory=True, drop_last=True)
+    val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False,
+                            num_workers=max(n_workers // 2, 1), pin_memory=True)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
+    scaler = torch.GradScaler(device, enabled=use_amp)
 
     warmup = len(train_loader) * 5
     total = len(train_loader) * args.epochs
@@ -143,7 +150,7 @@ def main():
     best_val = float('inf')
 
     total_batches = len(train_loader)
-    print(f'epochs: {args.epochs}, batches/epoch: {total_batches}')
+    print(f'epochs: {args.epochs}, batches/epoch: {total_batches}, workers: {n_workers}')
     print()
 
     for epoch in range(args.epochs):
@@ -154,13 +161,17 @@ def main():
 
         for mix, target in train_loader:
             mix, target = mix.to(device), target.to(device)
-            pred = model(mix)
-            loss = stft_loss(pred, target)
+
+            with torch.autocast(device_type=device, dtype=torch.bfloat16, enabled=use_amp):
+                pred = model(mix)
+                loss = stft_loss(pred, target)
 
             optimizer.zero_grad()
-            loss.backward()
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             scheduler.step()
 
             ep_loss += loss.item()
@@ -168,15 +179,15 @@ def main():
             lr = optimizer.param_groups[0]['lr']
             print(f'\r  epoch {epoch+1}/{args.epochs}  batch {n}/{total_batches}  loss: {ep_loss/n:.4f}  lr: {lr:.6f}', end='', flush=True)
 
-        # validate
         model.eval()
         val_loss = 0
         vn = 0
         with torch.no_grad():
             for mix, target in val_loader:
                 mix, target = mix.to(device), target.to(device)
-                pred = model(mix)
-                val_loss += stft_loss(pred, target).item()
+                with torch.autocast(device_type=device, dtype=torch.bfloat16, enabled=use_amp):
+                    pred = model(mix)
+                    val_loss += stft_loss(pred, target).item()
                 vn += 1
         val_loss /= max(vn, 1)
         elapsed = time.time() - t0
