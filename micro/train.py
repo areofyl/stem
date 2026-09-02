@@ -116,11 +116,12 @@ def main():
     parser.add_argument('--lr', type=float, default=3e-4)
     args = parser.parse_args()
 
-    device = 'cpu'
-    print(f'training micro separator for: {args.target}')
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f'training micro separator for: {args.target} ({device})')
 
     model = make_model().to(device)
-    torch.set_num_threads(8)
+    if device == 'cpu':
+        torch.set_num_threads(8)
 
     train_songs, val_songs = train_val_split(args.data, args.target)
     train_set = StemDataset(args.data, args.target, songs=train_songs)
@@ -152,6 +153,7 @@ def main():
         t0 = time.time()
 
         for mix, target in train_loader:
+            mix, target = mix.to(device), target.to(device)
             pred = model(mix)
             loss = stft_loss(pred, target)
 
@@ -172,6 +174,7 @@ def main():
         vn = 0
         with torch.no_grad():
             for mix, target in val_loader:
+                mix, target = mix.to(device), target.to(device)
                 pred = model(mix)
                 val_loss += stft_loss(pred, target).item()
                 vn += 1
