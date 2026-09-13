@@ -356,12 +356,16 @@ typedef struct {
 	char   *filename;
 	double azimuth;
 	double elevation;
-	float  stem_gain;   /* linear gain applied to this stem */
+	float  stem_gain;
+	char   eq_type;     /* 'v'=vocal highshelf, 'b'=bass lowpass, 0=none */
 
 	float  *samples_l;
 	float  *samples_r;
 	int    num_frames;
 	int    is_stereo;
+
+	/* pre-processing EQ (applied before spatialization) */
+	Biquad eq_l, eq_r;
 
 	/* direct sound: one binaural path per input channel */
 	BinauralState bin[2];
@@ -573,6 +577,12 @@ static void *stem_worker(void *arg)
 		float sig_l = (n < s->num_frames) ? s->samples_l[n] * s->stem_gain : 0.0f;
 		float sig_r = (n < s->num_frames) ? s->samples_r[n] * s->stem_gain : 0.0f;
 
+		/* per-stem EQ before spatialization */
+		if (s->eq_type) {
+			sig_l = biquad_tick(&s->eq_l, sig_l);
+			sig_r = biquad_tick(&s->eq_r, sig_r);
+		}
+
 		float L, R;
 		float mix_l = 0.0f, mix_r = 0.0f;
 
@@ -611,51 +621,77 @@ static void usage(const char *prog)
 		prog, prog);
 }
 
-static int parse_stem_arg(const char *arg, char **file, double *az, double *el, double *gain_db)
+static int parse_stem_arg(const char *arg, char **file, double *az, double *el, double *gain_db, char *eq_type)
 {
-	/* format: filename:azimuth:elevation[:gain_db] */
+	/* format: filename:azimuth:elevation[:gain_db[:eq]]
+	   eq is 'v' (vocal highshelf) or 'b' (bass lowpass) */
 	*gain_db = 0.0;
+	*eq_type = 0;
 
-	/* Count colons from the end to find fields */
-	const char *colons[4];
-	int ncolons = 0;
-	for (const char *p = arg + strlen(arg) - 1; p > arg && ncolons < 4; p--) {
-		if (*p == ':') colons[ncolons++] = p;
+	/* make a mutable copy so we can strip eq suffix */
+	char *buf = strdup(arg);
+	int len = strlen(buf);
+
+	/* strip trailing :v or :b */
+	if (len >= 2 && buf[len-2] == ':' && (buf[len-1] == 'v' || buf[len-1] == 'b')) {
+		*eq_type = buf[len-1];
+		buf[len-2] = '\0';
+		len -= 2;
 	}
 
-	if (ncolons < 2) return -1;
+	/* now parse file:az:el[:gain] from buf */
+	const char *colons[4];
+	int ncolons = 0;
+	for (const char *p = buf + len - 1; p > buf && ncolons < 4; p--)
+		if (*p == ':') colons[ncolons++] = p;
+
+	if (ncolons < 2) { free(buf); return -1; }
 
 	const char *p_el, *p_az, *p_gain = NULL;
 
 	if (ncolons >= 3) {
-		/* Could be file:az:el:gain or file-with-colon:az:el */
-		/* Try 4-field parse: check if the 3rd-from-end colon gives valid numbers */
-		p_gain = colons[0];  /* last colon -> gain */
-		p_el   = colons[1];  /* second-to-last -> el */
-		p_az   = colons[2];  /* third-to-last -> az */
-
-		/* Validate: az and el fields should look like numbers */
+		p_gain = colons[0];
+		p_el   = colons[1];
+		p_az   = colons[2];
+		/* validate: text between p_az and p_el should be a number */
 		char *end;
 		strtod(p_az + 1, &end);
+		/* accept if strtod consumed everything up to p_el */
 		if (end != p_el) {
-			/* 3-field: file-with-colon:az:el */
-			p_gain = NULL;
-			p_el = colons[0];
-			p_az = colons[1];
+			/* maybe file has colons — try fewer fields */
+			if (ncolons >= 4) {
+				p_gain = colons[0];
+				p_el   = colons[1];
+				p_az   = colons[2];
+				/* try one more back */
+				p_az = colons[3];
+				strtod(p_az + 1, &end);
+				if (end != colons[2]) {
+					p_gain = NULL;
+					p_el = colons[0];
+					p_az = colons[1];
+				}
+			} else {
+				p_gain = NULL;
+				p_el = colons[0];
+				p_az = colons[1];
+			}
 		}
 	} else {
 		p_el = colons[0];
 		p_az = colons[1];
 	}
 
-	int flen = (int)(p_az - arg);
+	int flen = (int)(p_az - buf);
 	*file = malloc(flen + 1);
-	memcpy(*file, arg, flen);
+	memcpy(*file, buf, flen);
 	(*file)[flen] = '\0';
 
 	*az = atof(p_az + 1) * M_PI / 180.0;
 	*el = atof(p_el + 1) * M_PI / 180.0;
 	if (p_gain) *gain_db = atof(p_gain + 1);
+
+	free(buf);
 	return 0;
 }
 
@@ -695,9 +731,9 @@ int main(int argc, char **argv)
 
 	for (int i = 0; i < nstem; i++) {
 		double az, el, gain_db;
-		char *file;
-		if (parse_stem_arg(argv[stem_start + i], &file, &az, &el, &gain_db) < 0) {
-			fprintf(stderr, "Bad stem arg: %s (expected file:az:el[:gain_db])\n",
+		char *file, eq_type;
+		if (parse_stem_arg(argv[stem_start + i], &file, &az, &el, &gain_db, &eq_type) < 0) {
+			fprintf(stderr, "Bad stem arg: %s (expected file:az:el[:gain[:eq]])\n",
 			        argv[stem_start + i]);
 			return 1;
 		}
@@ -705,11 +741,11 @@ int main(int argc, char **argv)
 		stems[i].azimuth   = az;
 		stems[i].elevation = el;
 		stems[i].stem_gain = (float)pow(10.0, gain_db / 20.0);
-		printf("  stem %d: %s at az=%.0f° el=%.0f°%s\n",
-		       i, file, az * 180.0 / M_PI, el * 180.0 / M_PI,
-		       gain_db != 0.0 ? "" : "");
-		if (gain_db != 0.0)
-			printf("           gain=%.1fdB\n", gain_db);
+		stems[i].eq_type   = eq_type;
+		printf("  stem %d: %s at az=%.0f° el=%.0f°", i, file, az * 180.0 / M_PI, el * 180.0 / M_PI);
+		if (gain_db != 0.0) printf(" gain=%.1fdB", gain_db);
+		if (eq_type) printf(" eq=%c", eq_type);
+		printf("\n");
 	}
 
 	int max_frames = 0;
@@ -732,8 +768,17 @@ int main(int argc, char **argv)
 			max_frames = stems[i].num_frames;
 	}
 
-	for (int i = 0; i < nstem; i++)
+	for (int i = 0; i < nstem; i++) {
 		init_stem_binaurals(&stems[i], (double)sample_rate);
+		/* init per-stem EQ */
+		if (stems[i].eq_type == 'v') {
+			biquad_hishelf(&stems[i].eq_l, 3000.0, 3.5, (double)sample_rate);
+			biquad_hishelf(&stems[i].eq_r, 3000.0, 3.5, (double)sample_rate);
+		} else if (stems[i].eq_type == 'b') {
+			biquad_lowpass(&stems[i].eq_l, 300.0, 0.707, (double)sample_rate);
+			biquad_lowpass(&stems[i].eq_r, 300.0, 0.707, (double)sample_rate);
+		}
+	}
 
 	/* Global late reverb */
 	Reverb reverb;
