@@ -446,28 +446,60 @@ static void forward_chunk(Model *m, const float *input_l, const float *input_r,
 		size_t layer_mark = scratch.used; /* reclaim after each layer */
 
 		/* --- band attention (at each time step, attend across bands) --- */
-		float *resid = arena_alloc(&scratch, n_bands * T * emb * sizeof(float));
-		float *normed = arena_alloc(&scratch, n_bands * emb * sizeof(float));
-		float *attn_out = arena_alloc(&scratch, n_bands * emb * sizeof(float));
-
-		for (int t = 0; t < T; t++) {
-			/* gather bands for this time step: x[b][t] for all b */
+		/* gather: x[n_bands, T, emb] -> gathered[T*n_bands, emb] for batched ops */
+		float *gathered = arena_alloc(&scratch, T * n_bands * emb * sizeof(float));
+		for (int t = 0; t < T; t++)
 			for (int b = 0; b < n_bands; b++)
-				memcpy(normed + b * emb, x + b * T * emb + t * emb, emb * sizeof(float));
+				memcpy(gathered + (t * n_bands + b) * emb,
+				       x + b * T * emb + t * emb, emb * sizeof(float));
 
-			layer_norm(normed, m->band_norm_g[l], m->band_norm_b[l], n_bands, emb);
-			multihead_attention(attn_out, normed, n_bands, emb, m->n_heads,
-				m->band_attn_in_w[l], m->band_attn_in_b[l],
-				m->band_attn_out_w[l], m->band_attn_out_b[l]);
+		/* batched layer norm + QKV projection */
+		layer_norm(gathered, m->band_norm_g[l], m->band_norm_b[l], T * n_bands, emb);
+		float *qkv_all = arena_alloc(&scratch, T * n_bands * 3 * emb * sizeof(float));
+		linear(qkv_all, gathered, m->band_attn_in_w[l], m->band_attn_in_b[l],
+		       T * n_bands, emb, 3 * emb);
 
-			/* residual: x += attn(norm(x)) */
-			for (int b = 0; b < n_bands; b++)
-				for (int e = 0; e < emb; e++) {
-					int idx = b * T * emb + t * emb + e;
-					resid[idx] = x[idx] + attn_out[b * emb + e];
+		/* per-timestep small attention (20×20 per head, cheap) */
+		float *attn_mid = arena_alloc(&scratch, T * n_bands * emb * sizeof(float));
+		{
+			int hd = emb / m->n_heads;
+			float sc = 1.0f / sqrtf((float)hd);
+			float *scores = arena_alloc(&scratch, n_bands * n_bands * sizeof(float));
+			for (int t = 0; t < T; t++) {
+				float *qkv = qkv_all + t * n_bands * 3 * emb;
+				float *aout = attn_mid + t * n_bands * emb;
+				for (int h = 0; h < m->n_heads; h++) {
+					int off = h * hd;
+					/* Q,K,V are interleaved as [n_bands, 3*emb], extract heads inline */
+					for (int i = 0; i < n_bands; i++)
+						for (int j = 0; j < n_bands; j++) {
+							float s = 0;
+							for (int k = 0; k < hd; k++)
+								s += qkv[i*3*emb + off + k] * qkv[j*3*emb + emb + off + k];
+							scores[i*n_bands+j] = s * sc;
+						}
+					softmax(scores, n_bands, n_bands);
+					for (int i = 0; i < n_bands; i++)
+						for (int k = 0; k < hd; k++) {
+							float s = 0;
+							for (int j = 0; j < n_bands; j++)
+								s += scores[i*n_bands+j] * qkv[j*3*emb + 2*emb + off + k];
+							aout[i*emb + off + k] = s;
+						}
 				}
+			}
 		}
-		memcpy(x, resid, n_bands * T * emb * sizeof(float));
+
+		/* batched output projection */
+		float *proj_out = arena_alloc(&scratch, T * n_bands * emb * sizeof(float));
+		linear(proj_out, attn_mid, m->band_attn_out_w[l], m->band_attn_out_b[l],
+		       T * n_bands, emb, emb);
+
+		/* scatter back + residual */
+		for (int t = 0; t < T; t++)
+			for (int b = 0; b < n_bands; b++)
+				for (int e = 0; e < emb; e++)
+					x[b*T*emb + t*emb + e] += proj_out[(t*n_bands+b)*emb + e];
 
 		/* band feedforward with residual */
 		float *ff_in = arena_alloc(&scratch, n_bands * T * emb * sizeof(float));
@@ -484,22 +516,20 @@ static void forward_chunk(Model *m, const float *input_l, const float *input_r,
 
 
 		/* --- time attention (for each band, attend across time) --- */
-		resid = arena_alloc(&scratch, n_bands * T * emb * sizeof(float));
-		normed = arena_alloc(&scratch, T * emb * sizeof(float));
-		attn_out = arena_alloc(&scratch, T * emb * sizeof(float));
+		float *t_normed = arena_alloc(&scratch, T * emb * sizeof(float));
+		float *t_attn = arena_alloc(&scratch, T * emb * sizeof(float));
 
 		for (int b = 0; b < n_bands; b++) {
 			float *band_data = x + b * T * emb;
-			memcpy(normed, band_data, T * emb * sizeof(float));
-			layer_norm(normed, m->time_norm_g[l], m->time_norm_b[l], T, emb);
-			multihead_attention(attn_out, normed, T, emb, m->n_heads,
+			memcpy(t_normed, band_data, T * emb * sizeof(float));
+			layer_norm(t_normed, m->time_norm_g[l], m->time_norm_b[l], T, emb);
+			multihead_attention(t_attn, t_normed, T, emb, m->n_heads,
 				m->time_attn_in_w[l], m->time_attn_in_b[l],
 				m->time_attn_out_w[l], m->time_attn_out_b[l]);
 
 			for (int i = 0; i < T * emb; i++)
-				resid[b * T * emb + i] = band_data[i] + attn_out[i];
+				band_data[i] += t_attn[i];
 		}
-		memcpy(x, resid, n_bands * T * emb * sizeof(float));
 
 		/* time feedforward with residual */
 		ff_in = arena_alloc(&scratch, n_bands * T * emb * sizeof(float));
@@ -594,8 +624,8 @@ int main(int argc, char **argv)
 	mkdir(output_dir, 0755);
 
 	/* two arenas: persistent (audio, output) and scratch (per-chunk, reset between chunks) */
-	scratch = arena_create((size_t)2 * 1024 * 1024 * 1024); /* 2GB scratch */
-	Arena persist = arena_create((size_t)1024 * 1024 * 1024); /* 1GB persistent */
+	scratch = arena_create((size_t)3 * 1024 * 1024 * 1024); /* 3GB scratch */
+	Arena persist = arena_create((size_t)2 * 1024 * 1024 * 1024); /* 2GB persistent */
 
 	printf("loading model...\n");
 	Model *m = load_model(model_path);
@@ -652,45 +682,34 @@ int main(int argc, char **argv)
 	int total_chunks = 0;
 	for (int p = 0; p < n_samples; p += stride) total_chunks++;
 
+	/* process all chunks sequentially (each chunk uses OpenBLAS threads internally) */
 	int chunk_i = 0;
 	for (int pos = 0; pos < n_samples; pos += stride) {
 		int end = pos + chunk_samples;
 		if (end > n_samples) end = n_samples;
 		int len = end - pos;
 
-		/* extract chunk */
 		float *chunk_l = calloc(chunk_samples, sizeof(float));
 		float *chunk_r = calloc(chunk_samples, sizeof(float));
 		memcpy(chunk_l, audio_l + pos, len * sizeof(float));
 		memcpy(chunk_r, audio_r + pos, len * sizeof(float));
 
-		/* process chunk */
 		float **chunk_out = calloc(n_out, sizeof(float *));
 		for (int i = 0; i < n_out; i++)
 			chunk_out[i] = calloc(chunk_samples, sizeof(float));
 
 		forward_chunk(m, chunk_l, chunk_r, (len < chunk_samples) ? chunk_samples : len, chunk_out);
 
-		/* overlap-add into output with crossfade */
 		for (int i = 0; i < n_out; i++) {
 			for (int s = 0; s < len; s++) {
 				int out_pos = pos + s;
 				if (out_pos >= n_samples) break;
-
 				float sample = chunk_out[i][s];
-
-				/* crossfade in overlap region at the start of this chunk */
-				if (pos > 0 && s < overlap_samples)
-					sample *= xfade_up[s];
-
-				/* crossfade at the end of previous chunk's overlap */
-				if (pos > 0 && s < overlap_samples)
-					out[i][out_pos] *= xfade_down[s];
-
-				if (pos > 0 && s < overlap_samples)
-					out[i][out_pos] += sample;
-				else
+				if (pos > 0 && s < overlap_samples) {
+					out[i][out_pos] = out[i][out_pos] * xfade_down[s] + sample * xfade_up[s];
+				} else {
 					out[i][out_pos] = sample;
+				}
 			}
 		}
 
@@ -700,25 +719,23 @@ int main(int argc, char **argv)
 		free(chunk_r);
 
 		chunk_i++;
-		fprintf(stderr, "  chunk %d/%d\n", chunk_i, total_chunks);
-		fflush(stdout);
+		fprintf(stderr, "  %d/%d\n", chunk_i, total_chunks);
 
 		if (end >= n_samples) break;
 	}
-	printf("\n");
 
 
 	clock_gettime(CLOCK_MONOTONIC, &t1);
 	float elapsed = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9f;
 	printf("done in %.1fs (%.1fx realtime)\n", elapsed, duration / elapsed);
 
-	/* save stems */
+	/* save stems (reuse one stereo buffer for all) */
 	const char *source_names[] = { "drums", "bass", "other", "vocals" };
+	float *stereo = malloc(n_samples * 2 * sizeof(float));
 	for (int s = 0; s < m->n_sources; s++) {
 		char path[512];
 		snprintf(path, sizeof(path), "%s/%s.wav", output_dir, source_names[s]);
 
-		float *stereo = arena_alloc(&persist, n_samples * 2 * sizeof(float));
 		for (int i = 0; i < n_samples; i++) {
 			stereo[i * 2 + 0] = out[s * 2 + 0][i];
 			stereo[i * 2 + 1] = out[s * 2 + 1][i];
@@ -735,6 +752,7 @@ int main(int argc, char **argv)
 			printf("  saved %s\n", source_names[s]);
 		}
 	}
+	free(stereo);
 
 	/* cleanup */
 	free(out);
