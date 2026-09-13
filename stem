@@ -14,7 +14,8 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 LIB_DIR="${SCRIPT_DIR}"
 [ -d "/usr/local/lib/stem" ] && LIB_DIR="/usr/local/lib/stem"
-SPATIALIZE="$(command -v spatialize 2>/dev/null || echo "$SCRIPT_DIR/spatialize")"
+SPATIALIZE="$SCRIPT_DIR/spatialize"
+[ -x "$SPATIALIZE" ] || SPATIALIZE="$(command -v spatialize 2>/dev/null)"
 FAST_SEP="$LIB_DIR/fast_separate.py"
 AUTOGLUE="$LIB_DIR/autoglue.py"
 
@@ -24,6 +25,7 @@ PRESET=default
 QUALITY=fast
 GLUE=auto
 CUSTOM_MODEL=""
+MICRO=0
 
 die() { printf "error: %s\n" "$1" >&2; exit 1; }
 
@@ -37,6 +39,7 @@ while [ $# -gt 0 ]; do
 		--theater) PRESET=theater; shift ;;
 		--glue) GLUE="$2"; shift 2 ;;
 		--model) CUSTOM_MODEL="$2"; shift 2 ;;
+		--micro) MICRO=1; shift ;;
 		-*) die "unknown flag: $1" ;;
 		*)  break ;;
 	esac
@@ -63,7 +66,9 @@ STEMDIR="$WORKDIR/stems"
 # show config (glue shown later if auto)
 DUR_STR="full track"
 [ "$DURATION" -gt 0 ] 2>/dev/null && DUR_STR="${DURATION}s"
-if [ -n "$CUSTOM_MODEL" ]; then
+if [ "$MICRO" = "1" ]; then
+	MODEL_STR="micro (4x 297K, parallel C)"
+elif [ -n "$CUSTOM_MODEL" ]; then
 	MODEL_STR="custom ($(basename "$CUSTOM_MODEL"))"
 elif [ "$QUALITY" = "fast" ]; then
 	MODEL_STR="htdemucs_ft (1 of 4 models)"
@@ -85,9 +90,32 @@ DEMUCS_INPUT="$WORKDIR/input.wav"
 
 echo " separating stems"
 
-if [ -n "$CUSTOM_MODEL" ]; then
+C_INFERENCE="$(command -v stem-inference 2>/dev/null || echo "$SCRIPT_DIR/inference")"
+MICRO_INFERENCE="$SCRIPT_DIR/micro/inference"
+MICRO_MODELS="$SCRIPT_DIR/micro/checkpoints"
+
+if [ "$MICRO" = "1" ]; then
+	[ -x "$MICRO_INFERENCE" ] || die "micro inference not built — cd micro && make"
+	for s in vocals drums bass other; do
+		[ -f "$MICRO_MODELS/$s.bin" ] || die "missing $MICRO_MODELS/$s.bin — run export_weights.py"
+	done
+	OPENBLAS_NUM_THREADS=2 "$MICRO_INFERENCE" \
+		"$MICRO_MODELS/vocals.bin" \
+		"$MICRO_MODELS/drums.bin" \
+		"$MICRO_MODELS/bass.bin" \
+		"$MICRO_MODELS/other.bin" \
+		"$DEMUCS_INPUT" "$STEMDIR"
+elif [ -n "$CUSTOM_MODEL" ]; then
 	[ -f "$CUSTOM_MODEL" ] || die "model not found: $CUSTOM_MODEL"
-	python3 "$SCRIPT_DIR/train/inference.py" "$CUSTOM_MODEL" "$DEMUCS_INPUT" "$STEMDIR"
+	case "$CUSTOM_MODEL" in
+		*.bin)
+			[ -x "$C_INFERENCE" ] || die "C inference engine not built — run: make"
+			OPENBLAS_NUM_THREADS=4 "$C_INFERENCE" "$CUSTOM_MODEL" "$DEMUCS_INPUT" "$STEMDIR"
+			;;
+		*)
+			python3 "$LIB_DIR/train/inference.py" "$CUSTOM_MODEL" "$DEMUCS_INPUT" "$STEMDIR"
+			;;
+	esac
 elif [ "$QUALITY" = "quality" ]; then
 	command -v demucs >/dev/null 2>&1 || die "demucs not found"
 	OMP_NUM_THREADS=8 demucs -n "$MODEL" "$DEMUCS_INPUT" -o "$WORKDIR/demucs_out"
@@ -99,11 +127,7 @@ fi
 
 [ -d "$STEMDIR" ] || die "stems not found at $STEMDIR"
 
-# per-stem EQ: brighten vocals, clean up bass bleed (parallel)
-echo " applying stem EQ"
-([ -f "$STEMDIR/vocals.wav" ] && ffmpeg -y -i "$STEMDIR/vocals.wav" -af "highshelf=f=3000:g=3.5" "$STEMDIR/vocals_eq.wav" 2>/dev/null && mv "$STEMDIR/vocals_eq.wav" "$STEMDIR/vocals.wav") &
-([ -f "$STEMDIR/bass.wav" ] && ffmpeg -y -i "$STEMDIR/bass.wav" -af "lowpass=f=300:p=2" "$STEMDIR/bass_eq.wav" 2>/dev/null && mv "$STEMDIR/bass_eq.wav" "$STEMDIR/bass.wav") &
-wait
+# EQ is now built into the spatializer (v=vocal highshelf, b=bass lowpass)
 
 # keep a copy of the stems (after EQ)
 SAVE_STEMS="stemmed-$BASENAME"
@@ -129,23 +153,41 @@ echo " spatializing"
 # +2.3dB on stems to match original loudness
 if [ "$PRESET" = "theater" ]; then
 	"$SPATIALIZE" -o "$OUTPUT" -r 0.22 \
-	    "$STEMDIR/vocals.wav:0:5:2.3" \
+	    "$STEMDIR/vocals.wav:0:5:2.3:v" \
 	    "$STEMDIR/drums.wav:170:20:2.3" \
 	    "$STEMDIR/guitar.wav:75:0:2.3" \
 	    "$STEMDIR/piano.wav:-75:0:2.3" \
 	    "$STEMDIR/other.wav:50:10:2.3" \
-	    "$STEMDIR/bass.wav:0:-10:-6" \
-	    "$STEMDIR/bass.wav:90:0:-9" \
-	    "$STEMDIR/bass.wav:180:0:-9" \
-	    "$STEMDIR/bass.wav:-90:0:-9" \
+	    "$STEMDIR/bass.wav:0:-10:-6:b" \
+	    "$STEMDIR/bass.wav:90:0:-9:b" \
+	    "$STEMDIR/bass.wav:180:0:-9:b" \
+	    "$STEMDIR/bass.wav:-90:0:-9:b" \
 	    ${GLUE_ARG:+"$GLUE_ARG"}
 else
 	"$SPATIALIZE" -o "$OUTPUT" -r 0.12 \
-	    "$STEMDIR/vocals.wav:0:0:2.3" \
+	    "$STEMDIR/vocals.wav:0:0:2.3:v" \
 	    "$STEMDIR/drums.wav:160:15:2.3" \
-	    "$STEMDIR/bass.wav:20:-5:2.3" \
+	    "$STEMDIR/bass.wav:20:-5:2.3:b" \
 	    "$STEMDIR/other.wav:-60:10:2.3" \
 	    ${GLUE_ARG:+"$GLUE_ARG"}
+fi
+
+# match loudness to original using RMS
+echo " matching loudness"
+GAIN_DB=$(python3 -c "
+import soundfile as sf; import numpy as np
+o,_=sf.read('$DEMUCS_INPUT',dtype='float32')
+s,_=sf.read('$OUTPUT',dtype='float32')
+n=min(len(o),len(s))
+o_rms=np.sqrt(np.mean(o[:n]**2))
+s_rms=np.sqrt(np.mean(s[:n]**2))
+if s_rms>1e-8: print(f'{20*np.log10(o_rms/s_rms):.1f}')
+else: print('0')
+")
+if [ "$GAIN_DB" != "0" ]; then
+	ffmpeg -y -i "$OUTPUT" -af "volume=${GAIN_DB}dB" "$WORKDIR/loud.wav" 2>/dev/null
+	mv "$WORKDIR/loud.wav" "$OUTPUT"
+	echo " applied ${GAIN_DB}dB gain"
 fi
 
 echo " done: $OUTPUT"
